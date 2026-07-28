@@ -886,6 +886,7 @@ pub const Page = struct {
             if ((x_end - x_start) < self.size.cols) {
                 copy.wrap = dst_row.wrap;
                 copy.wrap_continuation = dst_row.wrap_continuation;
+                copy.word_wrap = dst_row.word_wrap;
                 copy.grapheme = dst_row.grapheme;
                 copy.hyperlink = dst_row.hyperlink;
                 copy.styled = dst_row.styled;
@@ -1941,6 +1942,14 @@ pub const Row = packed struct(u64) {
     /// this row is a continuation of that row.
     wrap_continuation: bool = false,
 
+    /// True if this row was soft-wrapped at a word boundary (word wrap
+    /// mode, DEC private mode 2049). This is a refinement of `wrap`:
+    /// a word-wrapped row is always also `wrap`. The distinction lets
+    /// reflow-on-resize prefer word breaks over mid-word breaks. See the
+    /// WORD WRAP design doc. A word-wrap boundary is itself never set
+    /// unless `wrap` is also set.
+    word_wrap: bool = false,
+
     /// True if any of the cells in this row have multi-codepoint
     /// grapheme clusters. If this is true, some fast paths are not
     /// possible because erasing for example may need to clear existing
@@ -1995,7 +2004,7 @@ pub const Row = packed struct(u64) {
     /// screen.
     dirty: bool = false,
 
-    _padding: u23 = 0,
+    _padding: u22 = 0,
 
     /// The semantic prompt state of the row. See `semantic_prompt`.
     pub const SemanticPrompt = enum(u2) {

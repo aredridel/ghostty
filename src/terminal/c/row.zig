@@ -51,11 +51,18 @@ pub const RowData = enum(c_int) {
     /// Output type: bool *
     dirty = 8,
 
+    /// Whether this row was soft-wrapped at a word boundary (word wrap
+    /// mode, DEC private mode 2049). A word-wrapped row is always also
+    /// soft-wrapped (wrap). This distinguishes word-break wraps so
+    /// reflow-on-resize can prefer word boundaries.
+    /// Output type: bool *
+    word_wrap = 9,
+
     /// Output type expected for querying the data of the given kind.
     pub fn OutType(comptime self: RowData) type {
         return switch (self) {
             .invalid => void,
-            .wrap, .wrap_continuation, .grapheme, .styled, .hyperlink => bool,
+            .wrap, .wrap_continuation, .word_wrap, .grapheme, .styled, .hyperlink => bool,
             .kitty_virtual_placeholder, .dirty => bool,
             .semantic_prompt => SemanticPrompt,
         };
@@ -114,6 +121,7 @@ fn getTyped(
         .invalid => return .invalid_value,
         .wrap => out.* = row.wrap,
         .wrap_continuation => out.* = row.wrap_continuation,
+        .word_wrap => out.* = row.word_wrap,
         .grapheme => out.* = row.grapheme,
         .styled => out.* = row.styled,
         .hyperlink => out.* = row.hyperlink,

@@ -283,6 +283,14 @@ const entries: []const ModeEntry = &.{
     .{ .name = "grapheme_cluster", .value = 2027 },
     .{ .name = "report_color_scheme", .value = 2031 },
     .{ .name = "in_band_size_reports", .value = 2048 },
+    // Ghostty-private: word wrap mode. When enabled (and wraparound/DECAWM
+    // is also on), soft-wrapping breaks at the last word boundary on the
+    // row rather than mid-word at the right margin. A word boundary is a
+    // configurable set of codepoints (default: null, tab, vertical tab,
+    // space). Words longer than the line still break mid-word. The row's
+    // `word_wrap` flag marks word-boundary soft wraps so reflow-on-resize
+    // can prefer word breaks. See the WORD WRAP design doc.
+    .{ .name = "word_wrap", .value = 2049 },
 };
 
 test {
