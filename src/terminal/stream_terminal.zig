@@ -14,6 +14,7 @@ const Action = stream.Action;
 const Screen = @import("Screen.zig");
 const color = @import("color.zig");
 const modes = @import("modes.zig");
+const word_wrap = @import("word_wrap.zig");
 const osc = @import("osc.zig");
 const osc_color = @import("osc/parsers/color.zig");
 const kitty_clipboard = @import("kitty/clipboard.zig");
@@ -749,6 +750,14 @@ pub const Handler = struct {
                 // state; a failed transaction was already answered.
                 log.warn("error handling kitty clipboard err={}", .{err});
             },
+
+            .set_word_wrap_boundaries => {
+                // Update the Terminal's boundary set, then sync it into
+                // both the primary and alternate PageLists so reflow sees it.
+                _ = self.terminal.word_wrap_boundaries.set(value.codepoints);
+                self.syncWordWrapBoundaries();
+            },
+            .query_word_wrap_boundaries => self.replyWordWrapBoundaries(),
 
             // APC
             .apc_start => self.apc_handler.start(),
@@ -1945,6 +1954,40 @@ pub const Handler = struct {
         self.writePty(buf[0..len :0]);
     }
 
+    /// Sync the Terminal's word-wrap boundary set into every initialized
+    /// screen's PageList so reflow-on-resize can use it. The Terminal keeps
+    /// its own copy (for the print path); this mirrors it into page storage.
+    fn syncWordWrapBoundaries(self: *Handler) void {
+        var it = self.terminal.screens.all.iterator();
+        while (it.next()) |entry| {
+            entry.value.*.pages.word_wrap_boundaries =
+                self.terminal.word_wrap_boundaries;
+        }
+    }
+
+    /// Reply to a word-wrap boundary query with the current set:
+    ///   CSI > Pm... $ w
+    /// where Pm are the codepoint values in stored (ascending) order.
+    fn replyWordWrapBoundaries(self: *Handler) void {
+        // Worst case: 16 codepoints * up to 7 decimal digits + separators.
+        var buf: [word_wrap.max * 8 + 8]u8 = undefined;
+        var fbs = std.Io.Writer.Allocating.init(self.terminal.gpa());
+        defer fbs.deinit();
+        const w = &fbs.writer;
+        w.writeAll("\x1B[>") catch return;
+        const cps = self.terminal.word_wrap_boundaries.slice();
+        for (cps, 0..) |cp, i| {
+            if (i > 0) w.writeByte(';') catch return;
+            w.print("{}", .{cp}) catch return;
+        }
+        w.writeAll("$w") catch return;
+        const written = fbs.written();
+        if (written.len + 1 > buf.len) return;
+        @memcpy(buf[0..written.len], written);
+        buf[written.len] = 0;
+        self.writePty(buf[0..written.len :0]);
+    }
+
     fn queryKittyKeyboard(self: *Handler) void {
         // Max response is "\x1b[?31u\x00" (7 bytes): the flags are a u5 (max 31).
         var buf: [32]u8 = undefined;
@@ -2039,6 +2082,10 @@ pub const Handler = struct {
             .in_band_size_reports => if (enabled) self.reportMode2048(),
 
             .report_visibility => if (enabled) self.sendVisibilityReport(),
+
+            // Word wrap reads the boundary set inline in the print path. Make
+            // sure the active PageLists have the current set so reflow honors it.
+            .word_wrap => self.syncWordWrapBoundaries(),
 
             .mouse_event_x10 => {
                 if (enabled) {

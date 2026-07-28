@@ -351,6 +351,11 @@ pub const StreamHandler = struct {
                 if (self.terminal.flags.mouse_event != .none) .default else .text,
             ),
             .configure_charset => self.configureCharset(value.slot, value.charset),
+            .set_word_wrap_boundaries => {
+                _ = self.terminal.word_wrap_boundaries.set(value.codepoints);
+                self.syncWordWrapBoundaries();
+            },
+            .query_word_wrap_boundaries => try self.queryWordWrapBoundaries(),
             .set_attribute => {
                 @branchHint(.likely);
                 switch (value) {
@@ -626,6 +631,34 @@ pub const StreamHandler = struct {
             .data = data,
             .len = @intCast(writer.buffered().len),
         } });
+    }
+
+    /// Reply to a word-wrap boundary query with the current set:
+    ///   CSI > Pm... $ w
+    fn queryWordWrapBoundaries(self: *StreamHandler) !void {
+        var data: termio.Message.WriteReq.Small.Array = undefined;
+        var writer: std.Io.Writer = .fixed(&data);
+        writer.writeAll("\x1B[>") catch return;
+        const cps = self.terminal.word_wrap_boundaries.slice();
+        for (cps, 0..) |cp, i| {
+            if (i > 0) writer.writeByte(';') catch return;
+            writer.print("{}", .{cp}) catch return;
+        }
+        writer.writeAll("$w") catch return;
+        self.messageWriter(.{ .write_small = .{
+            .data = data,
+            .len = @intCast(writer.buffered().len),
+        } });
+    }
+
+    /// Sync the Terminal's word-wrap boundary set into every initialized
+    /// screen's PageList so reflow-on-resize can use it.
+    fn syncWordWrapBoundaries(self: *StreamHandler) void {
+        var it = self.terminal.screens.all.iterator();
+        while (it.next()) |entry| {
+            entry.value.*.pages.word_wrap_boundaries =
+                self.terminal.word_wrap_boundaries;
+        }
     }
 
     pub fn setMode(self: *StreamHandler, mode: terminal.Mode, enabled: bool) !void {

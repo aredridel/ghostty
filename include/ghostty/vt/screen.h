@@ -314,6 +314,16 @@ typedef enum GHOSTTY_ENUM_TYPED {
    * Output type: bool *
    */
   GHOSTTY_ROW_DATA_DIRTY = 8,
+
+  /**
+   * Whether this row was soft-wrapped at a word boundary (word wrap
+   * mode, DEC private mode 2049). A word-wrapped row is always also
+   * soft-wrapped (GHOSTTY_ROW_DATA_WRAP). This distinguishes word-break
+   * wraps so reflow-on-resize can prefer word boundaries.
+   *
+   * Output type: bool *
+   */
+  GHOSTTY_ROW_DATA_WORD_WRAP = 9,
   GHOSTTY_ROW_DATA_MAX_VALUE = GHOSTTY_ENUM_MAX_VALUE,
 } GhosttyRowData;
 

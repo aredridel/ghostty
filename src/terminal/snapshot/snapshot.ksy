@@ -390,7 +390,7 @@ types:
       Each named instance exposes one bit from the little-endian integer.
       Arithmetic division is used instead of bitwise operations because the
       JavaScript target implements those operations with signed 32-bit values.
-      All values remain exact because the registry occupies only 43 bits,
+      All values remain exact because the registry occupies only 44 bits,
       within JavaScript's 53-bit safe integer range.
     seq:
       - id: raw

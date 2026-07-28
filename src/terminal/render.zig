@@ -2512,6 +2512,7 @@ fn testCompareStates(
     const StaleOkMask = page.Mask(page.Row, &.{
         "wrap",
         "wrap_continuation",
+        "word_wrap",
         "semantic_prompt",
         "dirty",
     }, 1);

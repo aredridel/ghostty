@@ -16,6 +16,7 @@ const uucode = @import("uucode");
 
 const ansi = @import("ansi.zig");
 const modespkg = @import("modes.zig");
+const word_wrap = @import("word_wrap.zig");
 const charsets = @import("charsets.zig");
 const xt_checksum = @import("xt_checksum.zig");
 const csi = @import("csi.zig");
@@ -82,6 +83,13 @@ previous_char: ?u21 = null,
 
 /// The modes that this terminal currently has active.
 modes: modespkg.ModeState = .{},
+
+/// The word-wrap boundary codepoint set. Used by the print path when word
+/// wrap mode (DEC private mode 2049) is enabled. The Terminal keeps its own
+/// copy here (for fast print-path access) and syncs it into the active
+/// PageList's `word_wrap_boundaries` on mode/config changes so reflow can
+/// use it. See `word_wrap.zig`.
+word_wrap_boundaries: word_wrap.Set = .{},
 
 /// Terminal-level cursor state.
 cursor: Cursor = .{},
@@ -1793,7 +1801,237 @@ fn writeCell(
     }
 }
 
+/// Attempt a word-boundary soft wrap. Returns true if a word break was
+/// performed (the caller should do nothing more), or false if no usable
+/// boundary was found and the caller should fall back to normal char wrap.
+///
+/// When word wrap mode is on, this scans the current row backward from the
+/// right margin for the last word-boundary codepoint. If one is found with
+/// non-boundary content after it (a "word"), that word is moved to the
+/// start of the next line and the current row is marked `word_wrap`.
+///
+/// Words longer than the line width are not handled here: if no boundary
+/// exists or the word still exceeds the line, this returns false and the
+/// caller does a normal mid-word char wrap.
+///
+/// For v1, this handles only narrow (width-1) cells without grapheme
+/// clusters. If the word region contains wide chars or grapheme data, it
+/// returns false so the caller falls back to char wrap (correct, just not
+/// word-broken). This keeps the common case (ASCII text) fast and correct.
+fn printWordWrap(self: *Terminal) !bool {
+    const screen: *Screen = self.screens.active;
+    const cursor: *Screen.Cursor = &screen.cursor;
+
+    // The right margin of the scrolling region (exclusive). The last
+    // written column is right_limit - 1. When pending_wrap is set, the
+    // cursor is still at right_limit - 1.
+    const right_limit = if (cursor.x > self.scrolling_region.right)
+        self.cols
+    else
+        self.scrolling_region.right + 1;
+
+    // The left margin of the scrolling region.
+    const left = self.scrolling_region.left;
+
+    // We need at least 2 cells of room for a word break to make sense
+    // (boundary + at least one word char). If the region is too narrow,
+    // fall back to char wrap.
+    if (right_limit - left < 2) return false;
+
+    // Get the cells for the current row so we can scan them.
+    const page = cursor.page_pin.node.page();
+    const row = cursor.page_row;
+    const cells = row.cells.ptr(page.memory)[0..page.size.cols];
+
+    // Scan backward from the last written column to find the last word
+    // boundary. The last written column is right_limit - 1 (the cell that
+    // triggered pending_wrap). We scan [left .. right_limit-1] inclusive.
+    const last_written = right_limit - 1;
+    const boundaries = self.word_wrap_boundaries;
+
+    var boundary_x: ?size.CellCountInt = null;
+    {
+        var x = last_written;
+        while (x >= left) : (x = if (x == 0) break else x - 1) {
+            const cell = &cells[x];
+            // Skip spacer tails (part of a wide char to the left).
+            if (cell.wide == .spacer_tail) continue;
+            // Get the codepoint. If the cell is empty, treat null (0x00)
+            // as a boundary (it's in the default set).
+            const cp = cell.content.codepoint.data;
+            if (boundaries.contains(cp)) {
+                boundary_x = x;
+                break;
+            }
+            // If we hit a spacer_head, the wide char starts here; we can
+            // stop scanning (the boundary would be before the wide char).
+            if (cell.wide == .spacer_head) {
+                // The wide char is at x-1. Don't break mid-wide; continue
+                // scanning left of it.
+                if (x == 0) break;
+                continue;
+            }
+        }
+    }
+
+    // No boundary found: fall back to char wrap.
+    if (boundary_x == null) return false;
+
+    const boundary = boundary_x.?;
+
+    // The word starts at boundary + 1 and ends at last_written (inclusive).
+    // Its length is last_written - (boundary+1) + 1 == last_written - boundary.
+    // We compute it this way to avoid an integer underflow when the boundary
+    // is at the last column (boundary == last_written would make
+    // last_written - (boundary+1) underflow before the +1).
+    const word_start = boundary + 1;
+    const word_len = last_written - boundary;
+
+    // If the word length is zero, the boundary is at the last column: the
+    // row ends exactly on a word boundary — a clean word break. There's
+    // nothing to move, but we still mark word_wrap (at the real screen edge)
+    // so reflow knows this was a word break, then fall through to the
+    // normal char-wrap advance (which sets `wrap`).
+    if (word_len == 0) {
+        if (cursor.x == self.cols - 1) row.word_wrap = true;
+        return false;
+    }
+
+    // For v1, verify the word region contains only simple cells: narrow,
+    // no grapheme data, no hyperlinks. If not, fall back to char wrap for
+    // correctness. Wide chars and grapheme clusters require complex cell
+    // surgery; hyperlinks are dropped by the move. Styled cells are handled
+    // by re-interning the style object into the destination page below.
+    for (cells[word_start .. word_start + word_len]) |*cell| {
+        if (cell.wide != .narrow) return false;
+        if (cell.hasGrapheme()) return false;
+        if (cell.hyperlink) return false;
+    }
+
+    // Also verify the boundary cell itself and everything between left and
+    // boundary is narrow (we won't move those, but we need the boundary to
+    // be a simple cell so clearing is safe).
+    // Actually we only move/clear the word region, so this isn't needed.
+
+    // Save the word's codepoints and style objects so we can re-print
+    // them on the next line. We capture the full style object (not just the
+    // page-local id) because index() may move us onto a newly allocated page
+    // where the old id is meaningless. We must read the objects BEFORE
+    // clearCells: clearing releases style refs and could delete the style.
+    //
+    // Allocate scratch space sized to the word so there's no column cap.
+    // On allocation failure we fall back to char wrap rather than fail the
+    // print: word wrap is a cosmetic refinement and char wrap is always
+    // correct.
+    const alloc = self.gpa();
+    const saved_cps = alloc.alloc(u21, word_len) catch return false;
+    defer alloc.free(saved_cps);
+    const saved_styles = alloc.alloc(?style.Style, word_len) catch return false;
+    defer alloc.free(saved_styles);
+
+    for (cells[word_start .. word_start + word_len], 0..) |*cell, i| {
+        saved_cps[i] = cell.content.codepoint.data;
+        saved_styles[i] = if (cell.style_id == style.default_id)
+            null
+        else
+            page.styles.get(page.memory, cell.style_id).*;
+    }
+
+    // Convert any tab in the saved word to a space (per the design: tab is
+    // treated as a space for wrap purposes). The boundary itself stays.
+    for (saved_cps[0..word_len]) |*cp| {
+        if (cp.* == 0x09) cp.* = 0x20;
+    }
+
+    // Clear the word cells from the current row (boundary + 1 onward).
+    // We clear from word_start to right_limit (the rest of the row past
+    // the word is already empty or will be).
+    screen.clearCells(page, row, cells[word_start..right_limit]);
+
+    // Mark the current row as word-wrapped (and wrapped). Only if we're
+    // at the real screen edge (matching the mark_wrap logic in printWrap).
+    const mark_wrap = cursor.x == self.cols - 1;
+    if (mark_wrap) {
+        row.wrap = true;
+        row.word_wrap = true;
+    }
+
+    // Save semantic prompt state to extend to the next line.
+    const old_semantic = cursor.semantic_content;
+    const old_semantic_clear = cursor.semantic_content_clear_eol;
+
+    // Move to the next line (handles scrolling).
+    try self.index();
+    screen.cursorHorizontalAbsolute(left);
+
+    assert(cursor == &screen.cursor);
+
+    // Restore semantic prompt state and mark continuation.
+    cursor.semantic_content = old_semantic;
+    cursor.semantic_content_clear_eol = old_semantic_clear;
+    switch (old_semantic) {
+        .output, .input => {},
+        .prompt => cursor.page_row.semantic_prompt = .prompt_continuation,
+    }
+
+    if (mark_wrap) {
+        cursor.page_row.wrap_continuation = true;
+    }
+
+    // Re-print the saved word on the new line. We print each codepoint
+    // with its saved style. This reuses the print machinery so wide-char
+    // and grapheme interactions are handled if they somehow occur (they
+    // won't, since we bailed above for those cases).
+    //
+    // We temporarily set the cursor style for each cell. Since we're at
+    // the left margin with a fresh row, we can just write cells directly.
+    const new_page = cursor.page_pin.node.page();
+    const new_row = cursor.page_row;
+    const new_cells = new_row.cells.ptr(new_page.memory)[0..new_page.size.cols];
+
+    // Re-print the saved word on the new line. For styled cells, re-intern
+    // the captured style object into the destination page and use the new
+    // page-local id. If interning fails (page style set full), fall back to
+    // default style for that cell — the cell still wraps, it just loses its
+    // styling, which is safe and better than corrupting memory.
+    for (saved_cps, saved_styles, 0..) |cp, maybe_style, i| {
+        const x = left + @as(size.CellCountInt, @intCast(i));
+        if (x >= self.cols) break;
+        const cell = &new_cells[x];
+        cell.content_tag = .codepoint;
+        cell.content = .{ .codepoint = .{ .data = cp } };
+        cell.wide = .narrow;
+        const new_id = if (maybe_style) |style_obj|
+            new_page.styles.add(new_page.memory, style_obj) catch style.default_id
+        else
+            style.default_id;
+        cell.style_id = new_id;
+        if (new_id != style.default_id) new_row.styled = true;
+    }
+
+    // Move the cursor to just after the written word.
+    const new_x = left + @as(size.CellCountInt, @intCast(word_len));
+    if (new_x >= right_limit) {
+        // The word fills the new line exactly — set pending_wrap.
+        cursor.pending_wrap = true;
+        screen.cursorHorizontalAbsolute(right_limit - 1);
+    } else {
+        screen.cursorHorizontalAbsolute(new_x);
+    }
+
+    screen.cursorMarkDirty();
+    screen.assertIntegrity();
+    return true;
+}
+
 fn printWrap(self: *Terminal) !void {
+    // If word wrap is enabled (and wraparound is on, which is implied —
+    // printWrap is only called when wraparound is on), try to break at a
+    // word boundary instead of mid-word.
+    if (self.modes.get(.word_wrap)) {
+        if (try self.printWordWrap()) return;
+    }
+
     // We only mark that we soft-wrapped if we're at the edge of our
     // full screen. We don't mark the row as wrapped if we're in the
     // middle due to a right margin.
@@ -4186,6 +4424,7 @@ pub fn resize(
         .cols = opts.cols,
         .rows = opts.rows,
         .reflow = self.modes.get(.wraparound),
+        .word_wrap = self.modes.get(.word_wrap),
         .prompt_redraw = self.flags.shell_redraws_prompt,
         .pull_scrollback = self.flags.resize_pull_scrollback,
     });
@@ -5435,6 +5674,430 @@ test "Terminal: print single very long line" {
     // This would crash for issue 1400. So the assertion here is
     // that we simply do not crash.
     for (0..1000) |_| try t.print('x');
+}
+
+test "Terminal: word wrap breaks at space" {
+    var t = try init(testing.io, testing.allocator, .{ .rows = 5, .cols = 10 });
+    defer t.deinit(testing.allocator);
+
+    // Enable word wrap (bypassing the disabled gate for testing).
+    t.modes.set(.word_wrap, true);
+
+    // Print "hello world" into a 10-col terminal. "hello" is 5 chars,
+    // then a space (col 5), then "world" is 5 chars (cols 6-9). When
+    // the 10th char ('d') is printed, pending_wrap fires. With word
+    // wrap, the space at col 5 is the boundary, so "world" moves to
+    // the next line.
+    for ("hello world") |ch| try t.print(@intCast(ch));
+
+    // Row 0 should contain "hello" and be word-wrapped.
+    const row0 = t.screens.active.pages.getCell(.{ .screen = .{ .x = 0, .y = 0 } }).?;
+    try testing.expect(row0.row.wrap);
+    try testing.expect(row0.row.word_wrap);
+
+    // Row 1 should contain "world".
+    const row1_cell0 = t.screens.active.pages.getCell(.{ .screen = .{ .x = 0, .y = 1 } }).?;
+    try testing.expectEqual(@as(u21, 'w'), row1_cell0.cell.content.codepoint.data);
+    const row1_cell4 = t.screens.active.pages.getCell(.{ .screen = .{ .x = 4, .y = 1 } }).?;
+    try testing.expectEqual(@as(u21, 'd'), row1_cell4.cell.content.codepoint.data);
+
+    // The space should NOT be on row 1 (it stayed as the boundary on row 0).
+    // Actually, the space is the boundary and stays on row 0. Row 1 starts
+    // with 'w'.
+    try testing.expectEqual(@as(usize, 5), t.screens.active.cursor.x);
+    try testing.expectEqual(@as(usize, 1), t.screens.active.cursor.y);
+}
+
+test "Terminal: word wrap with word longer than line" {
+    var t = try init(testing.io, testing.allocator, .{ .rows = 5, .cols = 5 });
+    defer t.deinit(testing.allocator);
+
+    t.modes.set(.word_wrap, true);
+
+    // Print a 10-char word with no spaces into a 5-col terminal.
+    // Since there's no word boundary, it should fall back to char wrap.
+    for ("abcdefghij") |ch| try t.print(@intCast(ch));
+
+    // Row 0 should be char-wrapped (not word-wrapped) with "abcde".
+    const row0 = t.screens.active.pages.getCell(.{ .screen = .{ .x = 0, .y = 0 } }).?;
+    try testing.expect(row0.row.wrap);
+    try testing.expect(!row0.row.word_wrap);
+
+    // Row 1 should have "fghij".
+    const row1_cell0 = t.screens.active.pages.getCell(.{ .screen = .{ .x = 0, .y = 1 } }).?;
+    try testing.expectEqual(@as(u21, 'f'), row1_cell0.cell.content.codepoint.data);
+}
+
+test "Terminal: word wrap no-op when wraparound off" {
+    var t = try init(testing.io, testing.allocator, .{ .rows = 5, .cols = 5 });
+    defer t.deinit(testing.allocator);
+
+    t.modes.set(.word_wrap, true);
+    t.modes.set(.wraparound, false);
+
+    // With wraparound off, word wrap should be a no-op. Characters
+    // overwrite the last column.
+    for ("hello world") |ch| try t.print(@intCast(ch));
+
+    // Cursor should stay on row 0, at the last column.
+    try testing.expectEqual(@as(usize, 0), t.screens.active.cursor.y);
+    try testing.expectEqual(@as(usize, 4), t.screens.active.cursor.x);
+
+    // Row 0 should not be wrapped.
+    const row0 = t.screens.active.pages.getCell(.{ .screen = .{ .x = 0, .y = 0 } }).?;
+    try testing.expect(!row0.row.wrap);
+    try testing.expect(!row0.row.word_wrap);
+}
+
+test "Terminal: word wrap with tab as boundary" {
+    var t = try init(testing.io, testing.allocator, .{ .rows = 5, .cols = 10 });
+    defer t.deinit(testing.allocator);
+
+    t.modes.set(.word_wrap, true);
+
+    // Print "hello\tworld" — tab is a boundary. "hello" fills cols 0-4,
+    // tab at col 5, then "world" at cols 6-9 triggers pending_wrap.
+    // The tab is the boundary, so "world" moves to the next line.
+    for ("hello\tworld") |ch| try t.print(@intCast(ch));
+
+    const row0 = t.screens.active.pages.getCell(.{ .screen = .{ .x = 0, .y = 0 } }).?;
+    try testing.expect(row0.row.wrap);
+    try testing.expect(row0.row.word_wrap);
+
+    // Row 1 should start with 'w' (the tab is converted to space on move,
+    // but it's the boundary so it stays on row 0; row 1 gets "world").
+    const row1_cell0 = t.screens.active.pages.getCell(.{ .screen = .{ .x = 0, .y = 1 } }).?;
+    try testing.expectEqual(@as(u21, 'w'), row1_cell0.cell.content.codepoint.data);
+}
+
+test "Terminal: word wrap resize narrow re-breaks at words" {
+    const alloc = testing.allocator;
+    var t = try init(testing.io, alloc, .{ .cols = 20, .rows = 5 });
+    defer t.deinit(alloc);
+
+    t.modes.set(.word_wrap, true);
+
+    // Print "the quick brown fox" into 20 cols. This fits on one line
+    // (19 chars) so no wrapping occurs yet.
+    try t.printString("the quick brown fox");
+
+    // Now narrow to 10 cols. Reflow should re-break at word boundaries.
+    try t.resize(alloc, .{ .cols = 10, .rows = 5 });
+
+    // After reflow, the content should be word-wrapped across multiple rows.
+    // "the quick" (9 chars + boundary) fits in 10, then "brown fox".
+    const str = try t.plainString(alloc);
+    defer alloc.free(str);
+
+    // The exact layout depends on reflow, but the content should be intact
+    // and rows should carry word_wrap flags where words were broken.
+    // Verify row 0 is word-wrapped.
+    const row0 = t.screens.active.pages.getCell(.{ .screen = .{ .x = 0, .y = 0 } }).?;
+    try testing.expect(row0.row.wrap);
+    try testing.expect(row0.row.word_wrap);
+}
+
+test "Terminal: word wrap batched printSlice path" {
+    var t = try init(testing.io, testing.allocator, .{ .rows = 5, .cols = 10 });
+    defer t.deinit(testing.allocator);
+
+    t.modes.set(.word_wrap, true);
+
+    // Exercise the batched fast path (printSliceFast) with word wrap on.
+    // "hello world" in 10 cols: the batch fills "hello worl", pending_wrap
+    // fires, printWrap->printWordWrap moves "worl" to row 1, then the batch
+    // continues writing "d" giving "world". Result: "hello" / "world".
+    const cps: []const u32 = &.{ 'h', 'e', 'l', 'l', 'o', ' ', 'w', 'o', 'r', 'l', 'd' };
+    try t.printSlice(cps);
+
+    // Row 0 should be word-wrapped and contain "hello".
+    const row0 = t.screens.active.pages.getCell(.{ .screen = .{ .x = 0, .y = 0 } }).?;
+    try testing.expect(row0.row.wrap);
+    try testing.expect(row0.row.word_wrap);
+    const r0c4 = t.screens.active.pages.getCell(.{ .screen = .{ .x = 4, .y = 0 } }).?;
+    try testing.expectEqual(@as(u21, 'o'), r0c4.cell.content.codepoint.data);
+
+    // Row 1 should contain "world".
+    const r1c0 = t.screens.active.pages.getCell(.{ .screen = .{ .x = 0, .y = 1 } }).?;
+    try testing.expectEqual(@as(u21, 'w'), r1c0.cell.content.codepoint.data);
+    const r1c4 = t.screens.active.pages.getCell(.{ .screen = .{ .x = 4, .y = 1 } }).?;
+    try testing.expectEqual(@as(u21, 'd'), r1c4.cell.content.codepoint.data);
+}
+
+test "Terminal: word wrap batched multiple wraps" {
+    var t = try init(testing.io, testing.allocator, .{ .rows = 6, .cols = 10 });
+    defer t.deinit(testing.allocator);
+
+    t.modes.set(.word_wrap, true);
+
+    // "the quick brown fox" (19 chars) in 10 cols via the batched path.
+    // Should word-wrap into "the quick" / "brown fox" (or similar) with
+    // word_wrap flags set, content intact.
+    const cps: []const u32 = &.{ 't', 'h', 'e', ' ', 'q', 'u', 'i', 'c', 'k', ' ', 'b', 'r', 'o', 'w', 'n', ' ', 'f', 'o', 'x' };
+    try t.printSlice(cps);
+
+    // Row 0 should be word-wrapped (ends at a word boundary).
+    const row0 = t.screens.active.pages.getCell(.{ .screen = .{ .x = 0, .y = 0 } }).?;
+    try testing.expect(row0.row.word_wrap);
+
+    // Verify content is fully intact by rendering plain text.
+    const alloc = testing.allocator;
+    const str = try t.plainString(alloc);
+    defer alloc.free(str);
+    try testing.expect(std.mem.indexOf(u8, str, "quick") != null);
+    try testing.expect(std.mem.indexOf(u8, str, "brown") != null);
+    try testing.expect(std.mem.indexOf(u8, str, "fox") != null);
+}
+
+test "Terminal: word wrap preserves styled cells" {
+    var t = try init(testing.io, testing.allocator, .{ .rows = 5, .cols = 10 });
+    defer t.deinit(testing.allocator);
+
+    t.modes.set(.word_wrap, true);
+
+    // Print "hello " (default style) then bold "world". When the bold word
+    // triggers the wrap, word wrap must move it to the next row and preserve
+    // the bold style (cross-page style interning).
+    try t.printString("hello ");
+    try t.setAttribute(.{ .bold = {} });
+    try t.printString("world");
+
+    // Row 0 should be word-wrapped (breaks at the space before "world").
+    const row0 = t.screens.active.pages.getCell(.{ .screen = .{ .x = 0, .y = 0 } }).?;
+    try testing.expect(row0.row.wrap);
+    try testing.expect(row0.row.word_wrap);
+
+    // Content intact: row 0 is "hello ", row 1 is "world".
+    const r0c0 = t.screens.active.pages.getCell(.{ .screen = .{ .x = 0, .y = 0 } }).?;
+    try testing.expectEqual(@as(u21, 'h'), r0c0.cell.content.codepoint.data);
+    const r1c0 = t.screens.active.pages.getCell(.{ .screen = .{ .x = 0, .y = 1 } }).?;
+    try testing.expectEqual(@as(u21, 'w'), r1c0.cell.content.codepoint.data);
+
+    // The moved "world" cells must carry the bold style (non-default style_id).
+    const r1c0_style = t.screens.active.pages.getCell(.{ .screen = .{ .x = 0, .y = 1 } }).?;
+    try testing.expect(r1c0_style.cell.style_id != style.default_id);
+    const r1c4_style = t.screens.active.pages.getCell(.{ .screen = .{ .x = 4, .y = 1 } }).?;
+    try testing.expect(r1c4_style.cell.style_id != style.default_id);
+}
+
+test "Terminal: word wrap falls back on hyperlinked cells" {
+    var t = try init(testing.io, testing.allocator, .{ .rows = 5, .cols = 10 });
+    defer t.deinit(testing.allocator);
+
+    t.modes.set(.word_wrap, true);
+
+    // Print "hello " then a hyperlinked "world". The hyperlink is dropped
+    // by a cell move, so word wrap must bail and char-wrap to preserve it.
+    try t.printString("hello ");
+    try t.screens.active.startHyperlink("http://example.com", null);
+    try t.printString("world");
+    t.screens.active.endHyperlink();
+
+    const row0 = t.screens.active.pages.getCell(.{ .screen = .{ .x = 0, .y = 0 } }).?;
+    try testing.expect(row0.row.wrap);
+    try testing.expect(!row0.row.word_wrap);
+
+    // The hyperlink must survive (char wrap keeps cells in place).
+    const r0c6 = t.screens.active.pages.getCell(.{ .screen = .{ .x = 6, .y = 0 } }).?;
+    try testing.expect(r0c6.cell.hyperlink);
+}
+
+test "Terminal: word wrap respects left/right margins" {
+    var t = try init(testing.io, testing.allocator, .{ .cols = 10, .rows = 5 });
+    defer t.deinit(testing.allocator);
+
+    t.modes.set(.word_wrap, true);
+    t.modes.set(.enable_left_and_right_margin, true);
+    // Writable region cols 2-7 (0-indexed): 6 wide.
+    t.setLeftAndRightMargin(3, 8);
+
+    // Print "aa bbb cc" starting at the left margin. "aa " fills cols 2-4,
+    // "bbb" would overflow, so word wrap moves it to the next row — which
+    // must start at the left margin (col 2), not column 0.
+    t.setCursorPos(1, 3);
+    try t.printString("aa bbb cc");
+
+    // Row 0 keeps "aa " at cols 2-4.
+    const r0c2 = t.screens.active.pages.getCell(.{ .screen = .{ .x = 2, .y = 0 } }).?;
+    try testing.expectEqual(@as(u21, 'a'), r0c2.cell.content.codepoint.data);
+
+    // The moved "bbb" starts at the left margin (col 2) on row 1.
+    const r1c2 = t.screens.active.pages.getCell(.{ .screen = .{ .x = 2, .y = 1 } }).?;
+    try testing.expectEqual(@as(u21, 'b'), r1c2.cell.content.codepoint.data);
+}
+
+test "Terminal: word wrap with insert mode does not crash" {
+    var t = try init(testing.io, testing.allocator, .{ .cols = 10, .rows = 5 });
+    defer t.deinit(testing.allocator);
+
+    t.modes.set(.word_wrap, true);
+    t.modes.set(.insert, true);
+
+    // Insert mode shifts cells per print; combined with word wrap this is
+    // an unusual interaction. Verify it completes without crashing and the
+    // content is intact.
+    try t.printString("hello world");
+
+    const str = try t.plainString(testing.allocator);
+    defer testing.allocator.free(str);
+    try testing.expect(std.mem.indexOf(u8, str, "hello") != null);
+    try testing.expect(std.mem.indexOf(u8, str, "world") != null);
+}
+
+test "Terminal: word wrap falls back on wide char in word" {
+    var t = try init(testing.io, testing.allocator, .{ .cols = 10, .rows = 5 });
+    defer t.deinit(testing.allocator);
+
+    t.modes.set(.word_wrap, true);
+
+    // Print "hello " then a wide char (CJK) then "xy" — this fills the row
+    // exactly (6 + 2 + 2 = 10 cells). One more char triggers the wrap; the
+    // word crossing the margin contains a wide char, so word wrap must bail
+    // and char-wrap.
+    try t.printString("hello ");
+    try t.print(0x4F60); // 你 (wide, 2 cells)
+    try t.printString("xy");
+    try t.print('z'); // triggers the wrap
+
+    // Row 0 should be wrapped but NOT word-wrapped (wide char forced the
+    // char-wrap fallback), and the wide char must be intact.
+    const row0 = t.screens.active.pages.getCell(.{ .screen = .{ .x = 0, .y = 0 } }).?;
+    try testing.expect(row0.row.wrap);
+    try testing.expect(!row0.row.word_wrap);
+}
+
+test "Terminal: word wrap resize narrow with scrollback" {
+    // Reproduces the user's report from twirc: multiple long lines printed
+    // at a wide width, then resized narrower, must re-break at word
+    // boundaries without splitting words like "[pa|nthalassa]".
+    var t = try init(testing.io, testing.allocator, .{ .cols = 80, .rows = 6 });
+    defer t.deinit(testing.allocator);
+
+    t.modes.set(.word_wrap, true);
+
+    // Print several long lines that will be in scrollback after resize.
+    try t.printString("[panthalassa] * connected to panthalassa (75.101.144.172:6667)");
+    try t.print('\n');
+    try t.printString("[panthalassa] * [451] Connection not registered");
+    try t.print('\n');
+    try t.printString("[panthalassa] * [451] Connection not registered");
+    try t.print('\n');
+    try t.printString("[panthalassa] * server: Welcome to the Internet Relay Network");
+
+    // Narrow to 20 cols. The word "panthalassa" must not be split.
+    try t.resize(testing.allocator, .{ .cols = 20, .rows = 6 });
+
+    const str = try t.plainString(testing.allocator);
+    defer testing.allocator.free(str);
+
+    // No row should split "panthalassa" mid-word.
+    var line_it = std.mem.splitScalar(u8, str, '\n');
+    while (line_it.next()) |line| {
+        if (std.mem.indexOf(u8, line, "panthalassa")) |idx| {
+            // If the word appears, it must be complete — check the chars
+            // before and after are boundaries or string edges.
+            const before_ok = idx == 0 or line[idx - 1] == ' ';
+            const after_idx = idx + 11;
+            const after_ok = after_idx >= line.len or line[after_idx] == ']';
+            try testing.expect(before_ok and after_ok);
+        }
+    }
+}
+
+test "Terminal: word wrap resize narrow re-breaks long line" {
+    // Reproduces the real-world failure from twirc: a long IRC line
+    // printed at a wide width, then resized narrower, must re-break at
+    // word boundaries, not mid-word like "[pa|nthalassa]".
+    var t = try init(testing.io, testing.allocator, .{ .cols = 40, .rows = 8 });
+    defer t.deinit(testing.allocator);
+
+    t.modes.set(.word_wrap, true);
+
+    // Print a line longer than 40 cols so it wraps at print time.
+    try t.printString("[panthalassa] * connected to panthalassa (75.101.144.172:6667)");
+
+    // Narrow to 12 cols with word wrap on. Every break must be at a space,
+    // so no row should contain a partial word like "[pa" next to "nthalassa".
+    try t.resize(testing.allocator, .{ .cols = 12, .rows = 8 });
+
+    const str = try t.plainString(testing.allocator);
+    defer testing.allocator.free(str);
+    // The word "panthalassa" must not be split anywhere.
+    try testing.expect(std.mem.indexOf(u8, str, "panthalassa\n") != null or
+        std.mem.indexOf(u8, str, " panthalassa\n") != null or
+        std.mem.indexOf(u8, str, "panthalassa]") != null);
+    // And specifically the mid-word split must not appear.
+    try testing.expect(std.mem.indexOf(u8, str, "[pa\nnthalassa]") == null);
+    try testing.expect(std.mem.indexOf(u8, str, "[panth\nalassa]") == null);
+}
+
+test "Terminal: word wrap beyond 256 columns" {
+    const alloc = testing.allocator;
+    var t = try init(testing.io, alloc, .{ .cols = 300, .rows = 5 });
+    defer t.deinit(alloc);
+
+    t.modes.set(.word_wrap, true);
+
+    // 40 x's (cols 0-39), a space (col 40), then 259 y's (cols 41-299) fill
+    // the row. The 259-char word exceeds the old 256-cell fixed scratch cap,
+    // so this exercises the allocator-backed buffer: word wrap must move the
+    // whole y-word to the next line rather than falling back to char wrap.
+    for (0..40) |_| try t.print('x');
+    try t.print(' ');
+    for (0..259) |_| try t.print('y');
+    // The 300th char set pending_wrap; one more triggers the wrap.
+    try t.print('y');
+
+    // Row 0 should be word-wrapped (the 259-char word moved to row 1).
+    const row0 = t.screens.active.pages.getCell(.{ .screen = .{ .x = 0, .y = 0 } }).?;
+    try testing.expect(row0.row.wrap);
+    try testing.expect(row0.row.word_wrap);
+
+    // Row 1 should start with 'y'.
+    const row1 = t.screens.active.pages.getCell(.{ .screen = .{ .x = 0, .y = 1 } }).?;
+    try testing.expectEqual(@as(u21, 'y'), row1.cell.content.codepoint.data);
+}
+
+test "Terminal: word wrap resize narrow long word falls back to char wrap" {
+    const alloc = testing.allocator;
+    var t = try init(testing.io, alloc, .{ .cols = 20, .rows = 5 });
+    defer t.deinit(alloc);
+
+    t.modes.set(.word_wrap, true);
+
+    // Print a 20-char word with no spaces, then narrow to 10.
+    try t.printString("abcdefghijklmnopqrst");
+    try t.resize(alloc, .{ .cols = 10, .rows = 5 });
+
+    // With no word boundaries, reflow must char-wrap (word_wrap=false).
+    const row0 = t.screens.active.pages.getCell(.{ .screen = .{ .x = 0, .y = 0 } }).?;
+    try testing.expect(row0.row.wrap);
+    try testing.expect(!row0.row.word_wrap);
+}
+
+test "Terminal: word wrap resize widen rejoins" {
+    const alloc = testing.allocator;
+    var t = try init(testing.io, alloc, .{ .cols = 10, .rows = 5 });
+    defer t.deinit(alloc);
+
+    t.modes.set(.word_wrap, true);
+
+    // Print "hello world" into 10 cols — word-wraps ("hello" + "world").
+    try t.printString("hello world");
+
+    // Verify it word-wrapped.
+    const row0_before = t.screens.active.pages.getCell(.{ .screen = .{ .x = 0, .y = 0 } }).?;
+    try testing.expect(row0_before.row.word_wrap);
+
+    // Widen to 20 cols — the rows should rejoin.
+    try t.resize(alloc, .{ .cols = 20, .rows = 5 });
+
+    // After widening, the content should be on one line (rejoined).
+    const str = try t.plainString(alloc);
+    defer alloc.free(str);
+    // Content should be intact (no data loss).
+    try testing.expect(std.mem.indexOf(u8, str, "hello") != null);
+    try testing.expect(std.mem.indexOf(u8, str, "world") != null);
 }
 
 test "Terminal: print wide char" {

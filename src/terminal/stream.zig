@@ -15,6 +15,7 @@ const device_status = @import("device_status.zig");
 const csi = @import("csi.zig");
 const kitty = @import("kitty.zig");
 const modes = @import("modes.zig");
+const word_wrap = @import("word_wrap.zig");
 const osc = @import("osc.zig");
 const sgr = @import("sgr.zig");
 const continuationpkg = @import("stream_continuation.zig");
@@ -138,6 +139,8 @@ pub const Action = union(Key) {
     xt_checksum_extension: XtChecksumExtension,
     program_status: ProgramStatus,
     soft_reset,
+    set_word_wrap_boundaries: SetWordWrapBoundaries,
+    query_word_wrap_boundaries,
 
     pub const Key = lib.Enum(
         lib.target,
@@ -246,6 +249,8 @@ pub const Action = union(Key) {
             "xt_checksum_extension",
             "program_status",
             "soft_reset",
+            "set_word_wrap_boundaries",
+            "query_word_wrap_boundaries",
         },
     );
 
@@ -313,6 +318,21 @@ pub const Action = union(Key) {
     pub const ApcEnd = extern struct {
         /// False when CAN, SUB, or another aborting transition ended the APC.
         terminated: bool,
+    };
+
+    /// Payload for `set_word_wrap_boundaries`: the codepoints to use as
+    /// word-wrap boundaries. An empty slice resets to the default set.
+    pub const SetWordWrapBoundaries = struct {
+        codepoints: []const u21,
+
+        pub const C = extern struct {
+            codepoints: [*]const u21,
+            len: usize,
+        };
+
+        pub fn cval(self: SetWordWrapBoundaries) SetWordWrapBoundaries.C {
+            return .{ .codepoints = self.codepoints.ptr, .len = self.codepoints.len };
+        }
     };
 
     pub const InvokeCharset = lib.Struct(lib.target, struct {
@@ -2664,6 +2684,40 @@ pub fn Stream(comptime H: type) type {
                     ),
                 },
 
+                // Ghostty-private: word-wrap boundary configuration.
+                //   Set:    CSI > Pm... $ w  (Pm = codepoint values; empty/sole 0 = reset to default)
+                //   Query:  CSI > $ w        (no params; reply: CSI > Pm... $ w)
+                'w' => word_wrap_boundaries: {
+                    // The Ghostty private '>' marker comes first, then '$'.
+                    if (input.intermediates.len != 2 or
+                        input.intermediates[0] != '>' or
+                        input.intermediates[1] != '$')
+                    {
+                        log.warn("unimplemented CSI w: {f}", .{input});
+                        break :word_wrap_boundaries;
+                    }
+
+                    // Query form: no params. Reply with the current set.
+                    if (input.params.len == 0) {
+                        self.handler.vt(.query_word_wrap_boundaries, {});
+                        break :word_wrap_boundaries;
+                    }
+
+                    // Set form: params are codepoint values. An empty
+                    // reset is signaled by a sole param of 0.
+                    var buf: [word_wrap.max]u21 = undefined;
+                    var n: usize = 0;
+                    for (input.params) |p| {
+                        if (n >= word_wrap.max) break;
+                        buf[n] = std.math.cast(u21, p) orelse {
+                            log.warn("invalid word-wrap boundary codepoint {} in: {f}", .{ p, input });
+                            continue;
+                        };
+                        n += 1;
+                    }
+                    self.handler.vt(.set_word_wrap_boundaries, .{ .codepoints = buf[0..n] });
+                },
+
                 // DECSASD - Select Active Status Display
                 '}' => decsasd: {
                     // Verify we're getting a DECSASD command
@@ -3707,6 +3761,62 @@ test "stream: DECRQM dispatch" {
             try testing.expectEqualDeep(case.raw, s.handler.raw);
         }
     }
+}
+
+test "stream: word wrap mode (SM/RM 2049)" {
+    const H = struct {
+        mode: ?modes.Mode = null,
+
+        pub fn vt(
+            self: *@This(),
+            comptime action: Action.Tag,
+            value: Action.Value(action),
+        ) void {
+            switch (action) {
+                .set_mode => self.mode = value.mode,
+                .reset_mode => self.mode = null,
+                else => {},
+            }
+        }
+    };
+
+    var s: Stream(H) = .init(.{ .handler = .{} });
+    s.nextSlice("\x1B[?2049h");
+    try testing.expectEqual(@as(modes.Mode, .word_wrap), s.handler.mode.?);
+
+    s.nextSlice("\x1B[?2049l");
+    try testing.expect(s.handler.mode == null);
+}
+
+test "stream: word wrap boundary config (CSI > Pm $ w)" {
+    const H = struct {
+        set_cps: ?[]const u21 = null,
+        queried: bool = false,
+
+        pub fn vt(
+            self: *@This(),
+            comptime action: Action.Tag,
+            value: Action.Value(action),
+        ) void {
+            switch (action) {
+                .set_word_wrap_boundaries => self.set_cps = value.codepoints,
+                .query_word_wrap_boundaries => self.queried = true,
+                else => {},
+            }
+        }
+    };
+
+    var s: Stream(H) = .init(.{ .handler = .{} });
+    // Set boundaries to space (32) and underscore (95).
+    s.nextSlice("\x1B[>32;95$w");
+    try testing.expect(s.handler.set_cps != null);
+    try testing.expectEqual(@as(usize, 2), s.handler.set_cps.?.len);
+    try testing.expectEqual(@as(u21, 32), s.handler.set_cps.?[0]);
+    try testing.expectEqual(@as(u21, 95), s.handler.set_cps.?[1]);
+
+    // Query (no params).
+    s.nextSlice("\x1B[>$w");
+    try testing.expect(s.handler.queried);
 }
 
 test "stream: ansi set mode (SM) and reset mode (RM) with unknown value" {

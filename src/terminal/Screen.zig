@@ -2057,6 +2057,9 @@ pub const Resize = struct {
     /// lost from the top of the scrollback.
     reflow: bool = true,
 
+    /// Whether to prefer word boundaries when reflowing (word wrap mode).
+    word_wrap: bool = false,
+
     /// Set this to enable prompt redraw on resize. This signals
     /// that the running program can redraw the prompt if the cursor is
     /// currently at a prompt. This detects OSC133 prompts lines and clears
@@ -2157,6 +2160,7 @@ pub inline fn resize(
         .rows = opts.rows,
         .cols = opts.cols,
         .reflow = opts.reflow,
+        .word_wrap = opts.word_wrap,
         .cursor = .{
             .x = self.cursor.x,
             .y = self.cursor.y,

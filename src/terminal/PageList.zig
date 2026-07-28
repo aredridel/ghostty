@@ -23,6 +23,7 @@ const point = @import("point.zig");
 const pagepkg = @import("page.zig");
 const stylepkg = @import("style.zig");
 const size = @import("size.zig");
+const word_wrap = @import("word_wrap.zig");
 const OffsetBuf = size.OffsetBuf;
 const Capacity = pagepkg.Capacity;
 const Page = pagepkg.Page;
@@ -451,6 +452,13 @@ recycle_node: ?*List.Node = null,
 
 /// Limits for scrollback.
 limits: Limits,
+
+/// The word-wrap boundary codepoint set. This is used by reflow-on-resize
+/// to prefer word boundaries over mid-word breaks when a row carries the
+/// `word_wrap` flag. The Terminal keeps its own copy (for the print path)
+/// and syncs this one whenever the mode or config escape sequence changes.
+/// See `word_wrap.zig` and the WORD WRAP design doc.
+word_wrap_boundaries: word_wrap.Set = .{},
 
 /// The total number of rows represented by this PageList. This is used
 /// specifically for scrollbar information so we can have the total size.
@@ -1230,6 +1238,11 @@ pub const Resize = struct {
     /// be truncated if the new size is smaller than the old size.
     reflow: bool = true,
 
+    /// Whether to prefer word boundaries when reflowing (word wrap mode).
+    /// When true, reflow attempts to break at word boundaries instead of
+    /// mid-word. The boundary set is read from `word_wrap_boundaries`.
+    word_wrap: bool = false,
+
     /// Set this to the current cursor position in the active area. Some
     /// resize/reflow behavior depends on the cursor position.
     cursor: ?Cursor = null,
@@ -1478,6 +1491,7 @@ fn resizeCols(
     // Reflow all our rows.
     {
         var reflow_cursor: ReflowCursor = .init(first_rewritten_node);
+        reflow_cursor.word_wrap = opts.word_wrap;
         while (it.next()) |row| {
             try reflow_cursor.reflowRow(
                 self,
@@ -1595,6 +1609,9 @@ const ReflowCursor = struct {
     page_cell: *pagepkg.Cell,
     new_rows: usize,
 
+    /// Whether to prefer word boundaries when reflowing (word wrap mode).
+    word_wrap: bool = false,
+
     /// This is the final row count of the reflowed pages.
     total_rows: usize,
 
@@ -1663,9 +1680,12 @@ const ReflowCursor = struct {
         const cells = src_row.cells.ptr(src_page.memory)[0..src_page.size.cols];
 
         // Calculate the columns in this row. First up we trim non-semantic
-        // rightmost blanks.
+        // rightmost blanks. We normally skip trimming for soft-wrapped rows
+        // because the wrapped content may legitimately fill the row, but
+        // word-wrapped rows must be trimmed: the move cleared the cells past
+        // the boundary, and re-flowing those blanks would scatter the text.
         var cols_len = src_page.size.cols;
-        if (!src_row.wrap) {
+        if (!src_row.wrap or src_row.word_wrap) {
             while (cols_len > 0) {
                 if (!cells[cols_len - 1].isEmpty()) break;
                 cols_len -= 1;
@@ -1754,10 +1774,17 @@ const ReflowCursor = struct {
         var x: usize = 0;
         while (x < cols_len) {
             if (self.pending_wrap) {
-                self.page_row.wrap = true;
-                try self.cursorScrollOrNewPage(list, cap);
-                self.copyRowMetadata(src_row);
-                self.page_row.wrap_continuation = true;
+                // Try to break at a word boundary when word wrap is enabled.
+                // reflowWordBreak returns false (falling back to char wrap)
+                // if no usable boundary is found.
+                if (self.word_wrap and (try self.reflowWordBreak(list, cap, src_row))) {
+                    self.page_row.wrap_continuation = true;
+                } else {
+                    self.page_row.wrap = true;
+                    try self.cursorScrollOrNewPage(list, cap);
+                    self.copyRowMetadata(src_row);
+                    self.page_row.wrap_continuation = true;
+                }
             }
 
             // Fast path: bulk-copy a run of simple cells directly
@@ -2786,6 +2813,193 @@ const ReflowCursor = struct {
 
     fn copyRowMetadata(self: *ReflowCursor, other: *const Row) void {
         self.page_row.semantic_prompt = other.semantic_prompt;
+        self.page_row.word_wrap = other.word_wrap;
+    }
+
+    /// Attempt a word-boundary break on the current destination row during
+    /// reflow. Called when `pending_wrap` is set and the source row was
+    /// word-wrapped. Scans the dest row backward for the last word-boundary
+    /// codepoint. If found, moves the cells after it to a new row.
+    ///
+    /// Returns true if a word break was performed (caller should NOT do the
+    /// normal char wrap), or false if no boundary was found (caller should
+    /// fall back to char wrap).
+    ///
+    /// For v1, this handles only narrow cells. If the trailing region contains
+    /// wide chars or grapheme data, it returns false (falls back to char wrap).
+    fn reflowWordBreak(
+        self: *ReflowCursor,
+        list: *PageList,
+        cap: pagepkg.Capacity,
+        src_row: *const Row,
+    ) Allocator.Error!bool {
+        const boundaries = list.word_wrap_boundaries;
+        const cols = self.page.size.cols;
+        const cells = self.page_row.cells.ptr(self.page.memory)[0..cols];
+
+        log.debug("reflowWordBreak: cols={} boundary_count={} x={}", .{ cols, boundaries.count, self.x });
+
+        // The dest row is full (pending_wrap is set, cursor at cols-1).
+        // Scan backward from cols-1 to 0 for the last word boundary.
+        var boundary_x: ?usize = null;
+        {
+            var x: usize = cols;
+            while (x > 0) {
+                x -= 1;
+                const cell = &cells[x];
+                if (cell.wide == .spacer_tail) continue;
+                const cp = cell.content.codepoint.data;
+                if (boundaries.contains(cp)) {
+                    boundary_x = x;
+                    break;
+                }
+                if (cell.wide == .spacer_head) {
+                    // Wide char starts here; the boundary would be before it.
+                    // Keep scanning left.
+                    continue;
+                }
+            }
+        }
+
+        if (boundary_x == null) return false;
+        const boundary = boundary_x.?;
+
+        // The word is cells [boundary+1 .. cols-1].
+        const word_start = boundary + 1;
+        const word_len = cols - word_start;
+
+        // If the boundary is at the last column (word_len == 0), the row
+        // ends exactly at a word boundary. This is the ideal word break —
+        // mark it as word_wrap and let the normal char wrap advance the
+        // row. The next row starts with the next word.
+        if (word_len == 0) {
+            self.page_row.wrap = true;
+            self.page_row.word_wrap = true;
+            try self.cursorScrollOrNewPage(list, cap);
+            self.copyRowMetadata(src_row);
+            self.page_row.wrap_continuation = true;
+            return true;
+        }
+
+        // For v1, verify the word region contains only simple cells: narrow,
+        // no grapheme data, no hyperlinks. Styled cells are handled below by
+        // capturing the full style object and re-interning it into the
+        // destination page (which may be different after cursorScrollOrNewPage).
+        for (cells[word_start .. word_start + word_len]) |*cell| {
+            if (cell.wide != .narrow) return false;
+            if (cell.hasGrapheme()) return false;
+            if (cell.hyperlink) return false;
+        }
+
+        // Save the word cells (codepoint + style object). We capture the full
+        // style object (not just the page-local id) because the move may cross
+        // onto a newly allocated page where the old id is meaningless. We read
+        // the objects BEFORE releasing the source refs: release may delete a
+        // style with no remaining references.
+        //
+        // Allocate scratch space sized to the word so there's no column cap.
+        // On allocation failure we fall back to char wrap rather than fail
+        // the reflow: word wrap is a cosmetic refinement and char wrap is
+        // always correct.
+        const alloc = list.pool.alloc;
+        const saved_cps = alloc.alloc(u21, word_len) catch return false;
+        defer alloc.free(saved_cps);
+        const saved_styles = alloc.alloc(?stylepkg.Style, word_len) catch return false;
+        defer alloc.free(saved_styles);
+        for (cells[word_start .. word_start + word_len], 0..) |*cell, i| {
+            saved_cps[i] = cell.content.codepoint.data;
+            saved_styles[i] = if (cell.style_id == stylepkg.default_id)
+                null
+            else
+                self.page.styles.get(self.page.memory, cell.style_id).*;
+        }
+        // Convert tabs to spaces in the saved word.
+        for (saved_cps) |*cp| {
+            if (cp.* == 0x09) cp.* = 0x20;
+        }
+
+        // Release style references held by the source cells before clearing.
+        // We re-acquire them on the destination page via add() below.
+        {
+            var i: usize = word_start;
+            while (i < cols) {
+                const id = cells[i].style_id;
+                if (id == stylepkg.default_id) {
+                    i += 1;
+                    continue;
+                }
+                var j = i + 1;
+                while (j < cols and cells[j].style_id == id) j += 1;
+                self.page.styles.releaseMultiple(self.page.memory, id, @intCast(j - i));
+                i = j;
+            }
+        }
+
+        // Capture the old row location before we scroll so we can remap
+        // any tracked pins that point into the word region we're about to
+        // move. Without this, pins (cursor, marks) landing inside a
+        // re-broken word would be left pointing at the cleared source cells.
+        const old_node = self.node;
+        const old_y = self.y;
+
+        // Clear the word cells from the current dest row. Style references
+        // are already released above.
+        for (cells[word_start..cols]) |*cell| {
+            cell.* = .{};
+        }
+
+        // Mark the current row as word-wrapped.
+        self.page_row.wrap = true;
+        self.page_row.word_wrap = true;
+
+        // Start a new row.
+        try self.cursorScrollOrNewPage(list, cap);
+        self.copyRowMetadata(src_row);
+        self.page_row.wrap_continuation = true;
+
+        // Remap tracked pins that pointed at the moved word region on the
+        // old row to their new positions at the start of the new row.
+        {
+            const new_node = self.node;
+            const new_y = self.y;
+            const pin_keys = list.tracked_pins.keys();
+            for (pin_keys) |p| {
+                if (p.node == old_node and
+                    p.y == old_y and
+                    p.x >= word_start and
+                    p.x < cols)
+                {
+                    p.node = new_node;
+                    p.y = new_y;
+                    p.x = @intCast(@as(usize, p.x) - word_start);
+                }
+            }
+        }
+
+        // Write the saved word cells to the start of the new row. Re-intern
+        // captured style objects into the destination page. If interning
+        // fails (page style set full), fall back to default style — safe and
+        // better than corrupting memory.
+        const new_cells = self.page_row.cells.ptr(self.page.memory)[0..cols];
+        for (saved_cps, saved_styles, 0..) |cp, maybe_style, i| {
+            const cell = &new_cells[i];
+            cell.content_tag = .codepoint;
+            cell.content = .{ .codepoint = .{ .data = cp } };
+            cell.wide = .narrow;
+            const new_id = if (maybe_style) |style_obj|
+                self.page.styles.add(self.page.memory, style_obj) catch stylepkg.default_id
+            else
+                stylepkg.default_id;
+            cell.style_id = new_id;
+            if (new_id != stylepkg.default_id) self.page_row.styled = true;
+        }
+
+        // Position the cursor after the written word.
+        self.x = @intCast(word_len);
+        self.page_cell = &new_cells[@min(self.x, cols - 1)];
+        self.pending_wrap = (self.x >= cols - 1);
+
+        return true;
     }
 };
 
@@ -16209,6 +16423,89 @@ test "PageList resize reflow more cols wrapped rows" {
         try testing.expectEqual(@as(usize, 4), cells.len);
         try testing.expectEqual(@as(u21, 'A'), cells[0].content.codepoint.data);
         try testing.expectEqual(@as(u21, 'A'), cells[2].content.codepoint.data);
+    }
+}
+
+test "PageList resize reflow word wrap remaps tracked pins" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    // Row 0: "xx yy zz" in a 10-col terminal (fits, no wrap).
+    var s = try init(alloc, .{ .cols = 10, .rows = 4, .max_size = 0 });
+    defer s.deinit();
+    const page = s.pages.first.?.page();
+    const content = "xx yy zz";
+    for (content, 0..) |ch, x| {
+        const rac = page.getRowAndCell(x, 0);
+        rac.cell.* = .{
+            .content_tag = .codepoint,
+            .content = .{ .codepoint = .{ .data = ch } },
+        };
+    }
+
+    // Track a pin on the second 'y' (source col 4). When word wrap moves
+    // "yy" to the next row, this pin must follow it.
+    const p = try s.trackPin(s.pin(.{ .active = .{ .x = 4, .y = 0 } }).?);
+    defer s.untrackPin(p);
+
+    // Narrow to 5 cols with word wrap. "yy" should move to row 1.
+    try s.resize(.{ .cols = 5, .reflow = true, .word_wrap = true });
+
+    // Row 0 should be word-wrapped ("xx "), row 1 starts with "yy".
+    var it = s.rowIterator(.right_down, .{ .screen = .{} }, null);
+    {
+        const offset = it.next().?;
+        const rac = offset.rowAndCell();
+        const cells = offset.node.page().getCells(rac.row);
+        try testing.expect(rac.row.word_wrap);
+        try testing.expectEqual(@as(u21, 'x'), cells[0].content.codepoint.data);
+    }
+
+    // The tracked pin must have followed the moved 'y' to row 1, col 1.
+    try testing.expectEqual(point.Point{ .active = .{
+        .x = 1,
+        .y = 1,
+    } }, s.pointFromPin(.active, p.*).?);
+}
+
+test "PageList resize reflow word wrap boundary at last column" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    // Row 0: "ab cd" in a 5-col terminal (fits, no wrap).
+    var s = try init(alloc, .{ .cols = 5, .rows = 4, .max_size = 0 });
+    defer s.deinit();
+    const page = s.pages.first.?.page();
+    const content = "ab cd";
+    for (content, 0..) |ch, x| {
+        const rac = page.getRowAndCell(x, 0);
+        rac.cell.* = .{
+            .content_tag = .codepoint,
+            .content = .{ .codepoint = .{ .data = ch } },
+        };
+    }
+
+    // Narrow to 3 cols with word wrap. The dest row fills with "ab " — the
+    // trailing space lands exactly on the last column (a boundary). This
+    // exercises the reflowWordBreak word_len == 0 branch: a clean word break
+    // marked word_wrap with no cells to move. Row 1 gets "cd".
+    try s.resize(.{ .cols = 3, .reflow = true, .word_wrap = true });
+
+    var it = s.rowIterator(.right_down, .{ .screen = .{} }, null);
+    {
+        const offset = it.next().?;
+        const rac = offset.rowAndCell();
+        const cells = offset.node.page().getCells(rac.row);
+        try testing.expect(rac.row.wrap);
+        try testing.expect(rac.row.word_wrap);
+        try testing.expectEqual(@as(u21, 'a'), cells[0].content.codepoint.data);
+    }
+    {
+        const offset = it.next().?;
+        const rac = offset.rowAndCell();
+        const cells = offset.node.page().getCells(rac.row);
+        try testing.expect(rac.row.wrap_continuation);
+        try testing.expectEqual(@as(u21, 'c'), cells[0].content.codepoint.data);
     }
 }
 
