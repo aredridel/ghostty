@@ -5241,6 +5241,71 @@ test "Terminal: word wrap falls back on wide char in word" {
     try testing.expect(!row0.row.word_wrap);
 }
 
+test "Terminal: word wrap resize narrow with scrollback" {
+    // Reproduces the user's report from twirc: multiple long lines printed
+    // at a wide width, then resized narrower, must re-break at word
+    // boundaries without splitting words like "[pa|nthalassa]".
+    var t = try init(testing.io, testing.allocator, .{ .cols = 80, .rows = 6 });
+    defer t.deinit(testing.allocator);
+
+    t.modes.set(.word_wrap, true);
+
+    // Print several long lines that will be in scrollback after resize.
+    try t.printString("[panthalassa] * connected to panthalassa (75.101.144.172:6667)");
+    try t.print('\n');
+    try t.printString("[panthalassa] * [451] Connection not registered");
+    try t.print('\n');
+    try t.printString("[panthalassa] * [451] Connection not registered");
+    try t.print('\n');
+    try t.printString("[panthalassa] * server: Welcome to the Internet Relay Network");
+
+    // Narrow to 20 cols. The word "panthalassa" must not be split.
+    try t.resize(testing.allocator, .{ .cols = 20, .rows = 6 });
+
+    const str = try t.plainString(testing.allocator);
+    defer testing.allocator.free(str);
+
+    // No row should split "panthalassa" mid-word.
+    var line_it = std.mem.splitScalar(u8, str, '\n');
+    while (line_it.next()) |line| {
+        if (std.mem.indexOf(u8, line, "panthalassa")) |idx| {
+            // If the word appears, it must be complete — check the chars
+            // before and after are boundaries or string edges.
+            const before_ok = idx == 0 or line[idx - 1] == ' ';
+            const after_idx = idx + 11;
+            const after_ok = after_idx >= line.len or line[after_idx] == ']';
+            try testing.expect(before_ok and after_ok);
+        }
+    }
+}
+
+test "Terminal: word wrap resize narrow re-breaks long line" {
+    // Reproduces the real-world failure from twirc: a long IRC line
+    // printed at a wide width, then resized narrower, must re-break at
+    // word boundaries, not mid-word like "[pa|nthalassa]".
+    var t = try init(testing.io, testing.allocator, .{ .cols = 40, .rows = 8 });
+    defer t.deinit(testing.allocator);
+
+    t.modes.set(.word_wrap, true);
+
+    // Print a line longer than 40 cols so it wraps at print time.
+    try t.printString("[panthalassa] * connected to panthalassa (75.101.144.172:6667)");
+
+    // Narrow to 12 cols with word wrap on. Every break must be at a space,
+    // so no row should contain a partial word like "[pa" next to "nthalassa".
+    try t.resize(testing.allocator, .{ .cols = 12, .rows = 8 });
+
+    const str = try t.plainString(testing.allocator);
+    defer testing.allocator.free(str);
+    // The word "panthalassa" must not be split anywhere.
+    try testing.expect(std.mem.indexOf(u8, str, "panthalassa\n") != null or
+        std.mem.indexOf(u8, str, " panthalassa\n") != null or
+        std.mem.indexOf(u8, str, "panthalassa]") != null);
+    // And specifically the mid-word split must not appear.
+    try testing.expect(std.mem.indexOf(u8, str, "[pa\nnthalassa]") == null);
+    try testing.expect(std.mem.indexOf(u8, str, "[panth\nalassa]") == null);
+}
+
 test "Terminal: word wrap beyond 256 columns" {
     const alloc = testing.allocator;
     var t = try init(testing.io, alloc, .{ .cols = 300, .rows = 5 });

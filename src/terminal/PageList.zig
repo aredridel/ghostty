@@ -1656,9 +1656,12 @@ const ReflowCursor = struct {
         const cells = src_row.cells.ptr(src_page.memory)[0..src_page.size.cols];
 
         // Calculate the columns in this row. First up we trim non-semantic
-        // rightmost blanks.
+        // rightmost blanks. We normally skip trimming for soft-wrapped rows
+        // because the wrapped content may legitimately fill the row, but
+        // word-wrapped rows must be trimmed: the move cleared the cells past
+        // the boundary, and re-flowing those blanks would scatter the text.
         var cols_len = src_page.size.cols;
-        if (!src_row.wrap) {
+        if (!src_row.wrap or src_row.word_wrap) {
             while (cols_len > 0) {
                 if (!cells[cols_len - 1].isEmpty()) break;
                 cols_len -= 1;
