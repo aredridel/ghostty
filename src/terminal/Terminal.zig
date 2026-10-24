@@ -15065,10 +15065,14 @@ test "Terminal: eraseLogicalLine leaves neighbouring lines alone" {
     defer t.deinit(alloc);
 
     // Row 0 "AB", rows 1-2 the wrapped line "CDEFG12", row 3 "ZZ".
-    for ("AB\r\nCDEFG12\r\nZZ") |c| try t.print(c);
+    // Fed as a VT stream: print() writes codepoints verbatim and does not
+    // interpret CR/LF.
+    var stream = t.vtStream();
+    defer stream.deinit();
+    stream.nextSlice("AB\r\nCDEFG12\r\nZZ");
 
-    // Cursor in the middle of the wrapped line.
-    t.setCursorPos(1, 2);
+    // Cursor in the middle of the wrapped line (setCursorPos is 1-based).
+    t.setCursorPos(2, 2);
     t.eraseLogicalLine(false);
 
     // Cursor homes to the first row of the erased logical line.
@@ -15094,12 +15098,15 @@ test "Terminal: eraseLogicalLine covers word-wrapped rows" {
     var t = try init(io_impl, alloc, .{ .rows = 5, .cols = 5 });
     defer t.deinit(alloc);
 
-    // Word wrap moves the trailing word instead of breaking mid-word.
-    t.modes.set(.word_wrap, true);
-    t.screens.active.pages.word_wrap_boundaries = t.word_wrap_boundaries;
+    // Word wrap moves the trailing word instead of breaking mid-word. Fed as
+    // a VT stream so the mode reaches the page list's boundary set the same
+    // way it does in production.
+    var stream = t.vtStream();
+    defer stream.deinit();
+    stream.nextSlice("\x1b[?2049h");
 
     // "AB CDE" fits 5 cells, so "CD" moves down and "E" follows it.
-    for ("AB CDE") |c| try t.print(c);
+    stream.nextSlice("AB CDE");
     try testing.expect(t.screens.active.pages.getCell(.{ .active = .{} }).?.row.wrap);
     try testing.expect(t.screens.active.pages.getCell(.{ .active = .{} }).?.row.word_wrap);
 
