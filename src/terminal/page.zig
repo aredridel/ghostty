@@ -899,6 +899,19 @@ pub const Page = struct {
                 copy.hyperlink = dst_row.hyperlink;
                 copy.styled = dst_row.styled;
                 copy.dirty |= dst_row.dirty;
+
+                // The cloned range [x_start, x_end) now holds the src's
+                // cells; content past x_end is still dst's. Overcounting is
+                // harmless (blanks copy lazily), undercounting would drop
+                // real content on reflow, so take the optimistic bound.
+                copy.content_cols = @max(dst_row.content_cols, x_end);
+            } else {
+                // The whole dst row is overwritten by src[x_start .. x_end):
+                // content columns are the src's content within that window.
+                copy.content_cols = @min(
+                    self.size.cols,
+                    @max(@as(usize, src_row.content_cols), x_start) - x_start,
+                );
             }
 
             // Our cell offset remains the same
@@ -2080,7 +2093,16 @@ pub const Row = packed struct(u64) {
     /// screen.
     dirty: bool = false,
 
-    _padding: u22 = 0,
+    /// The number of content columns in this row: the columns that carry
+    /// text, up to and including the last one. Cells at \`content_cols\` and
+    /// beyond are blank or purely decorative (word-move seam cells, erased
+    /// tails painted with the pen) and reflow drops them. The engine records
+    /// this at write/erase time so reflow never has to infer "where does
+    /// content end" from cell attributes — including styled blanks, which
+    /// isEmpty() cannot classify. 0 for a fully blank row.
+    content_cols: u16 = 0,
+
+    _padding: u6 = 0,
 
     /// The semantic prompt state of the row. See `semantic_prompt`.
     pub const SemanticPrompt = enum(u2) {

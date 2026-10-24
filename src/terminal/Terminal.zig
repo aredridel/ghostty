@@ -1019,6 +1019,10 @@ fn printSliceFill(
                 cursor.page_row.dirty = true;
                 if (style_id != style.default_id) cursor.page_row.styled = true;
                 cells[0] = spacer;
+                cursor.page_row.content_cols = @max(
+                    cursor.page_row.content_cols,
+                    @as(u16, @intCast(cursor.x + 1)),
+                );
                 try self.printWrap();
                 continue :outer;
             }
@@ -1228,6 +1232,16 @@ fn printSliceFill(
             if (style_id != style.default_id) cursor.page_row.styled = true;
             self.previous_char = @intCast(cps[printed + k / cells_per_cp - 1]);
             printed += k / cells_per_cp;
+
+            // Track the row's content columns: the run spans columns
+            // cursor.x .. cursor.x + k - 1 (wide cells counted with their
+            // spacer). Reflow truncates at this boundary. Note the cursor
+            // has not advanced yet; at the right margin it stays on the
+            // last column with pending_wrap set, so count the full run.
+            cursor.page_row.content_cols = @max(
+                cursor.page_row.content_cols,
+                @as(u16, @intCast(cursor.x + k)),
+            );
 
             // Advance the cursor. If we filled through the right limit
             // then the cursor stays on the last cell with the pending
@@ -1799,6 +1813,14 @@ fn writeCell(
         page.clearHyperlink(cell);
         page.updateRowHyperlinkFlag(self.screens.active.cursor.page_row);
     }
+
+    // Track the row's content columns: every written cell (narrow, wide
+    // head, or the spacer that follows a wide head) extends it. Reflow
+    // truncates each row at this boundary instead of inferring content from
+    // cell attributes.
+    const content_x: u16 = @intCast(self.screens.active.cursor.x + 1);
+    const page_row = self.screens.active.cursor.page_row;
+    page_row.content_cols = @max(page_row.content_cols, content_x);
 }
 
 /// Attempt a word-boundary soft wrap. Returns true if a word break was
@@ -1948,6 +1970,13 @@ fn printWordWrap(self: *Terminal) !bool {
     // the word is already empty or will be).
     screen.clearCells(page, row, cells[word_start..right_limit]);
 
+    // The seam rows' content ends at the boundary cell: the space that
+    // separates the moved word is still content even though everything
+    // after it was cleared (clearCells clamps content_cols to the clear
+    // start, which would drop that space). Reflow must keep it so the
+    // rejoined line doesn't lose word separators.
+    row.content_cols = boundary + 1;
+
     // Mark the current row as word-wrapped (and wrapped). Only if we're
     // at the real screen edge (matching the mark_wrap logic in printWrap).
     const mark_wrap = cursor.x == self.cols - 1;
@@ -2018,6 +2047,9 @@ fn printWordWrap(self: *Terminal) !bool {
     } else {
         screen.cursorHorizontalAbsolute(new_x);
     }
+
+    // The moved word is content on the new row.
+    new_row.content_cols = @max(new_row.content_cols, @min(new_x, right_limit));
 
     screen.cursorMarkDirty();
     screen.assertIntegrity();

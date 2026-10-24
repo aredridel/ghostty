@@ -1876,6 +1876,19 @@ pub fn clearCells(
     }
 
     @memset(cells, self.blankCell());
+
+    // Maintain the row's content columns. If the erase reaches past the
+    // last content column, content ends at the left edge of the erased
+    // range; otherwise content beyond the erase survives unchanged.
+    // This also handles the word-move seam (clearCells of the moved-word
+    // tail) and the erase-with-pen case, so reflow never has to inspect
+    // cell attributes.
+    const row_cells = page.getCells(row);
+    const x0 = @intFromPtr(&cells[0]) - @intFromPtr(&row_cells[0]);
+    const x1 = x0 + cells.len;
+    if (row.content_cols > x0 and x1 >= row.content_cols) {
+        row.content_cols = @intCast(@min(x0, std.math.maxInt(u16)));
+    }
 }
 
 /// Clear cells but only if they are not protected.
@@ -3962,6 +3975,13 @@ pub fn testWriteString(self: *Screen, text: []const u8) !void {
 
             else => unreachable,
         }
+
+        // Record the row content boundary (mirrors the production print path)
+        // so reflow tests exercise the real mapped invariant.
+        self.cursor.page_row.content_cols = @max(
+            self.cursor.page_row.content_cols,
+            @as(u16, @intCast(self.cursor.x + 1)),
+        );
 
         if (self.cursor.x + 1 < self.pages.cols) {
             self.cursorRight(1);

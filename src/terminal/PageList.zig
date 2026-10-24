@@ -1679,22 +1679,18 @@ const ReflowCursor = struct {
         const src_y = row.y;
         const cells = src_row.cells.ptr(src_page.memory)[0..src_page.size.cols];
 
-        // Calculate the columns in this row. First up we trim non-semantic
-        // rightmost blanks. We normally skip trimming for soft-wrapped rows
-        // because the wrapped content may legitimately fill the row, but
-        // word-wrapped rows must be trimmed: the move cleared the cells past
-        // the boundary, and re-flowing those blanks would scatter the text.
-        var cols_len = src_page.size.cols;
-        if (!src_row.wrap or src_row.word_wrap) {
-            while (cols_len > 0) {
-                if (!cells[cols_len - 1].isEmpty()) break;
-                cols_len -= 1;
-            }
+        // Calculate the columns in this row. The row tracks its own content
+        // width (content_cols), maintained at write/erase time: everything
+        // beyond it is blank or decorative — the word-move seam, erased tails
+        // painted with the pen — and must be dropped so it doesn't scatter
+        // through the reflowed text. Relying on cell attributes (isEmpty, or
+        // "has text") is fragile: styled seam blanks are not isEmpty(), and
+        // that gap is why a widen-reflow once left interior gaps.
+        var cols_len: usize = src_row.content_cols;
 
-            // If the row has a semantic prompt then the blank row is meaningful
-            // so we just consider pretend the first cell of the row isn't empty.
-            if (cols_len == 0 and src_row.semantic_prompt != .none) cols_len = 1;
-        }
+        // If the row has a semantic prompt then the blank row is meaningful
+        // so we just consider pretend the first cell of the row isn't empty.
+        if (cols_len == 0 and src_row.semantic_prompt != .none) cols_len = 1;
 
         // Handle tracked pin adjustments. We also note whether any
         // tracked pin is on this row at all so that the per-cell loop
@@ -1804,6 +1800,7 @@ const ReflowCursor = struct {
                 const run = bulkRunLength(window);
                 if (run > 0 and self.copyRun(window[0..run], src_page)) {
                     x += run;
+                    self.noteContentWritten();
                     continue;
                 }
             }
@@ -1873,6 +1870,8 @@ const ReflowCursor = struct {
                     // the same existing cell.
                 },
             }
+
+            self.noteContentWritten();
         }
 
         // If the source row isn't wrapped then we should scroll afterwards.
@@ -2816,6 +2815,18 @@ const ReflowCursor = struct {
         self.page_row.word_wrap = other.word_wrap;
     }
 
+    /// Record that the destination row now carries content up to the
+    /// cursor. When the row filled to the margin, cursorForward set
+    /// pending_wrap WITHOUT advancing self.x, so a full row is explicitly
+    /// all columns.
+    fn noteContentWritten(self: *ReflowCursor) void {
+        if (self.pending_wrap) {
+            self.page_row.content_cols = self.page.size.cols;
+        } else if (self.page_row.content_cols < self.x) {
+            self.page_row.content_cols = @intCast(self.x);
+        }
+    }
+
     /// Attempt a word-boundary break on the current destination row during
     /// reflow. Called when `pending_wrap` is set and the source row was
     /// word-wrapped. Scans the dest row backward for the last word-boundary
@@ -2873,6 +2884,7 @@ const ReflowCursor = struct {
         // mark it as word_wrap and let the normal char wrap advance the
         // row. The next row starts with the next word.
         if (word_len == 0) {
+            self.page_row.content_cols = self.page.size.cols;
             self.page_row.wrap = true;
             self.page_row.word_wrap = true;
             try self.cursorScrollOrNewPage(list, cap);
@@ -2948,6 +2960,11 @@ const ReflowCursor = struct {
             cell.* = .{};
         }
 
+        // The seam starts at the boundary: content on this row ends at the
+        // word-start column. Record it so reflow never re-inspects these
+        // cells (they may be styled blanks), then start the new row.
+        self.page_row.content_cols = @intCast(word_start);
+
         // Mark the current row as word-wrapped.
         self.page_row.wrap = true;
         self.page_row.word_wrap = true;
@@ -2998,6 +3015,9 @@ const ReflowCursor = struct {
         self.x = @intCast(word_len);
         self.page_cell = &new_cells[@min(self.x, cols - 1)];
         self.pending_wrap = (self.x >= cols - 1);
+
+        // The moved word is the new row's content.
+        self.noteContentWritten();
 
         return true;
     }
