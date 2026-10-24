@@ -995,7 +995,7 @@ test "decode accepts unordered sparse style IDs and ignores zero" {
     var descending: [
         Header.len +
             2 * (2 + style.len) +
-            3 + 2 * 8 + 4
+            grid.row_header_len + 2 * 8 + 4
     ]u8 = undefined;
     var descending_writer: std.Io.Writer = .fixed(&descending);
     try header.encode(&descending_writer);
@@ -1003,8 +1003,9 @@ test "decode accepts unordered sparse style IDs and ignores zero" {
     try style.encode(.{ .flags = .{ .bold = true } }, &descending_writer);
     try io.writeInt(&descending_writer, TerminalStyleId, 2);
     try style.encode(.{ .flags = .{ .italic = true } }, &descending_writer);
-    try descending_writer.writeByte(@bitCast(grid.Row{ .cell_width = .eight }));
-    try io.writeInt(&descending_writer, u16, 2); // cell count
+    var descending_row_header: [grid.row_header_len]u8 = undefined;
+    grid.encodeRowHeader(&descending_row_header, .{ .cell_width = .eight }, 2, 2);
+    try descending_writer.writeAll(&descending_row_header);
     try io.writeInt(&descending_writer, u64, @bitCast(grid.Cell{
         .content = 'A',
         .style_id = 3,
@@ -1044,7 +1045,7 @@ test "decode accepts unordered sparse style IDs and ignores zero" {
         .string_capacity_bytes = 0,
     };
 
-    var zero: [Header.len + 2 + style.len + 7]u8 = undefined;
+    var zero: [Header.len + 2 + style.len + grid.row_header_len + 4]u8 = undefined;
     var zero_writer: std.Io.Writer = .fixed(&zero);
     try one_header.encode(&zero_writer);
     try io.writeInt(&zero_writer, TerminalStyleId, 0);
@@ -1087,7 +1088,7 @@ test "decode accepts unordered sparse hyperlink IDs" {
     var encoded: [
         Header.len +
             2 * 14 +
-            3 + 2 * 8 + 4
+            grid.row_header_len + 2 * 8 + 4
     ]u8 = undefined;
     var writer: std.Io.Writer = .fixed(&encoded);
     try header.encode(&writer);
@@ -1095,8 +1096,9 @@ test "decode accepts unordered sparse hyperlink IDs" {
     try hyperlink.encode(first, &writer);
     try io.writeInt(&writer, TerminalHyperlinkId, 2);
     try hyperlink.encode(second, &writer);
-    try writer.writeByte(@bitCast(grid.Row{ .cell_width = .eight }));
-    try io.writeInt(&writer, u16, 2); // cell count
+    var row_header: [grid.row_header_len]u8 = undefined;
+    grid.encodeRowHeader(&row_header, .{ .cell_width = .eight }, 2, 2);
+    try writer.writeAll(&row_header);
     try io.writeInt(&writer, u64, @bitCast(grid.Cell{
         .content = 'A',
         .hyperlink = true,
@@ -1162,11 +1164,12 @@ test "decode defaults missing sparse cell references" {
         .string_capacity_bytes = 0,
     };
 
-    var style_encoded: [Header.len + 3 + 8 + 4]u8 = undefined;
+    var style_encoded: [Header.len + grid.row_header_len + 8 + 4]u8 = undefined;
     var style_writer: std.Io.Writer = .fixed(&style_encoded);
     try style_header.encode(&style_writer);
-    try style_writer.writeByte(0x30); // row flags, full cell width
-    try io.writeInt(&style_writer, u16, 1); // cell count
+    var style_row_header: [grid.row_header_len]u8 = undefined;
+    grid.encodeRowHeader(&style_row_header, .{ .cell_width = .eight }, 1, 1);
+    try style_writer.writeAll(&style_row_header);
     try io.writeInt(&style_writer, u64, @bitCast(grid.Cell{
         .style_id = 1,
     }));
@@ -1195,11 +1198,12 @@ test "decode defaults missing sparse cell references" {
         .string_capacity_bytes = 0,
     };
 
-    var hyperlink_encoded: [Header.len + 3 + 8 + 4]u8 = undefined;
+    var hyperlink_encoded: [Header.len + grid.row_header_len + 8 + 4]u8 = undefined;
     var hyperlink_writer: std.Io.Writer = .fixed(&hyperlink_encoded);
     try hyperlink_header.encode(&hyperlink_writer);
-    try hyperlink_writer.writeByte(0x30); // row flags, full cell width
-    try io.writeInt(&hyperlink_writer, u16, 1); // cell count
+    var hyperlink_row_header: [grid.row_header_len]u8 = undefined;
+    grid.encodeRowHeader(&hyperlink_row_header, .{ .cell_width = .eight }, 1, 1);
+    try hyperlink_writer.writeAll(&hyperlink_row_header);
     try io.writeInt(&hyperlink_writer, u64, @bitCast(grid.Cell{
         .hyperlink = true,
         .hyperlink_id = 1,
@@ -1234,14 +1238,15 @@ test "decode normalizes invalid grid semantics" {
         .string_capacity_bytes = 0,
     };
 
-    var encoded: [Header.len + 3 + 3 * 8 + 4 + 10]u8 = undefined;
+    var encoded: [Header.len + grid.row_header_len + 3 * 8 + 4 + 10]u8 = undefined;
     var writer: std.Io.Writer = .fixed(&encoded);
     try header.encode(&writer);
 
-    // Preserve wrap while degrading the unknown semantic-prompt value to none
-    // and ignoring all reserved row bits.
+    // Preserve wrap and word wrap while degrading the unknown semantic-prompt
+    // value to none and ignoring the reserved row bit.
     try writer.writeByte(0xFD);
-    try io.writeInt(&writer, u16, 3);
+    try io.writeInt(&writer, u16, 3); // content columns
+    try io.writeInt(&writer, u16, 3); // encoded cell count
 
     // A text cell replaces an invalid Unicode scalar with U+FFFD while its
     // reserved semantic content degrades to output.

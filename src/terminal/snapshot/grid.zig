@@ -30,8 +30,9 @@
 //! | Offset | Size              | Field                      |
 //! | -----: | ----------------: | :------------------------- |
 //! |      0 |                 1 | Row flags                  |
-//! |      1 |                 2 | Encoded cell count (`u16`) |
-//! |      3 | `width` * `count` | Encoded cells              |
+//! |      1 |                 2 | Content columns (`u16`)   |
+//! |      3 |                 2 | Encoded cell count (`u16`) |
+//! |      5 | `width` * `count` | Encoded cells              |
 //!
 //! The row flag byte has the following format:
 //!
@@ -41,7 +42,17 @@
 //! |    1 | Wrap continuation         |
 //! |  2-3 | Semantic prompt           |
 //! |  4-5 | Encoded cell width        |
-//! |  6-7 | Reserved, zero            |
+//! |    6 | Word wrap                 |
+//! |    7 | Reserved, zero            |
+//!
+//! Content columns is the number of columns the row's content occupies,
+//! including the seam space of a word-wrapped row where the engine records
+//! it. It is the row's `content_cols` on the native side: everything past
+//! it is blank or decorative (a word-move seam, an erased tail painted with
+//! the pen). Decoders clamp it to the page width; canonical encoders emit
+//! the native value. Preserving it keeps reflow-on-resize exact after a
+//! restore, since cell attributes cannot distinguish a styled decorative
+//! blank from text.
 //!
 //! Semantic prompt values are:
 //!
@@ -258,8 +269,13 @@ pub const Row = packed struct(u8) {
     wrap_continuation: bool = false,
     semantic_prompt: u2 = 0,
     cell_width: Cell.EncodedWidth = .one,
-    _padding: u2 = 0,
+    word_wrap: bool = false,
+    _padding: u1 = 0,
 };
+
+/// The number of bytes in a row record header: the flag byte, the row's
+/// content columns, and the encoded cell count.
+pub const row_header_len: usize = 5;
 
 /// The wire layout of one encoded cell. This is its own registry: the bit
 /// positions and field meanings are part of the snapshot format and are
@@ -454,6 +470,33 @@ pub const EncodeError = std.Io.Writer.Error || error{
     TooManyGraphemes,
 };
 
+/// Encode one row record header: the flag byte, the row's content columns,
+/// and the encoded cell count.
+pub fn encodeRowHeader(
+    out: []u8,
+    row_header: Row,
+    content_cols: u16,
+    count: usize,
+) void {
+    assert(out.len == row_header_len);
+    out[0] = @bitCast(row_header);
+    std.mem.writeInt(u16, out[1..3], content_cols, .little);
+    std.mem.writeInt(u16, out[3..5], @intCast(count), .little);
+}
+
+/// Write one row record header into a test writer: the flag byte, the row's
+/// content columns, and the encoded cell count.
+fn writeTestRowHeader(
+    writer: *std.Io.Writer,
+    row: Row,
+    content_cols: u16,
+    count: u16,
+) !void {
+    var buf: [row_header_len]u8 = undefined;
+    encodeRowHeader(&buf, row, content_cols, count);
+    try writer.writeAll(&buf);
+}
+
 /// Encode every row, cell, and grapheme suffix directly from a page.
 ///
 /// If an error is returned, partial data may have been written. If you
@@ -508,6 +551,7 @@ pub fn encode(
             .wrap_continuation = row.wrap_continuation,
             .semantic_prompt = @backingInt(row.semantic_prompt),
             .cell_width = cell_width,
+            .word_wrap = row.word_wrap,
         };
 
         // The bulk codec emits the row header and its encoded cells directly
@@ -519,12 +563,11 @@ pub fn encode(
             switch (cell_width) {
                 inline .one, .two, .four => |width| {
                     const size = comptime width.size();
-                    const needed = 3 + count * size;
+                    const needed = row_header_len + count * size;
                     if (writer.unusedCapacityLen() < needed) break :emit;
                     const out = writer.unusedCapacitySlice()[0..needed];
-                    out[0] = @bitCast(row_header);
-                    std.mem.writeInt(u16, out[1..3], @intCast(count), .little);
-                    encodeNarrowInto(width, words, count, out[3..]);
+                    encodeRowHeader(out[0..row_header_len], row_header, row.content_cols, count);
+                    encodeNarrowInto(width, words, count, out[row_header_len..]);
                     writer.advance(needed);
                     continue;
                 },
@@ -534,18 +577,12 @@ pub fn encode(
                     // need to fall back to the loop below.
                     const witness: Cell = @bitCast(word_or);
                     if (!witness.hyperlink and witness.hyperlink_id == 0) {
-                        const needed = 3 + count * 8;
+                        const needed = row_header_len + count * 8;
                         if (writer.unusedCapacityLen() < needed) break :emit;
                         const out = writer.unusedCapacitySlice()[0..needed];
-                        out[0] = @bitCast(row_header);
-                        std.mem.writeInt(
-                            u16,
-                            out[1..3],
-                            @intCast(count),
-                            .little,
-                        );
+                        encodeRowHeader(out[0..row_header_len], row_header, row.content_cols, count);
                         @memcpy(
-                            out[3..],
+                            out[row_header_len..],
                             std.mem.sliceAsBytes(cells[0..count]),
                         );
                         writer.advance(needed);
@@ -555,11 +592,10 @@ pub fn encode(
             }
         }
 
-        // Row header: flags then the encoded cell count.
+        // Row header: flags, content columns, then the encoded cell count.
         {
-            var header_bytes: [3]u8 = undefined;
-            header_bytes[0] = @bitCast(row_header);
-            std.mem.writeInt(u16, header_bytes[1..3], @intCast(count), .little);
+            var header_bytes: [row_header_len]u8 = undefined;
+            encodeRowHeader(&header_bytes, row_header, row.content_cols, count);
             try writer.writeAll(&header_bytes);
         }
 
@@ -848,12 +884,12 @@ pub fn decode(
 ) DecodeError!void {
     for (0..page.size.rows) |y| {
         // Read the row header and cell count.
-        const row_header: Row, const count: u16 = header: {
+        const row_header: Row, const content_cols: u16, const count: u16 = header: {
             // The staged payload path has every header buffered.
-            var row_header_bytes: [3]u8 = undefined;
-            if (reader.bufferedLen() >= 3) {
-                row_header_bytes = reader.buffered()[0..3].*;
-                reader.toss(3);
+            var row_header_bytes: [row_header_len]u8 = undefined;
+            if (reader.bufferedLen() >= row_header_len) {
+                row_header_bytes = reader.buffered()[0..row_header_len].*;
+                reader.toss(row_header_len);
             } else {
                 try reader.readSliceAll(&row_header_bytes);
             }
@@ -862,13 +898,14 @@ pub fn decode(
             // width enum decode directly, and the raw semantic value gets a
             // default below. Reserved bits do not change the known fields.
             const row_header: Row = @bitCast(row_header_bytes[0]);
-            const count = std.mem.readInt(u16, row_header_bytes[1..3], .little);
-            break :header .{ row_header, count };
+            const content_cols = std.mem.readInt(u16, row_header_bytes[1..3], .little);
+            const count = std.mem.readInt(u16, row_header_bytes[3..5], .little);
+            break :header .{ row_header, content_cols, count };
         };
 
         // A fully default row needs no work at all: decoded pages start
         // zeroed, which is exactly the default row and cell state.
-        if (@as(u8, @bitCast(row_header)) == 0 and count == 0) continue;
+        if (@as(u8, @bitCast(row_header)) == 0 and content_cols == 0 and count == 0) continue;
 
         // Update the row fields through one load and store instead of a
         // read-modify-write per packed field.
@@ -876,6 +913,10 @@ pub fn decode(
         var row_value = row.*;
         row_value.wrap = row_header.wrap;
         row_value.wrap_continuation = row_header.wrap_continuation;
+        row_value.word_wrap = row_header.word_wrap;
+        // Clamp the content boundary: a decoder must never trust a row to
+        // claim more content columns than the page has.
+        row_value.content_cols = @min(content_cols, page.size.cols);
         row_value.semantic_prompt = std.enums.fromInt(
             TerminalRow.SemanticPrompt,
             row_header.semantic_prompt,
@@ -1851,11 +1892,11 @@ test "grid elides trailing default cells" {
     var writer: std.Io.Writer = .fixed(&encoded);
     try encode(&page, &writer);
 
-    // 3 bytes per row header and cells only through the last non-default
+    // One row header and cells only through the last non-default
     // cell, followed by an empty grapheme section. The text row uses the
     // one-byte width while the protected flag forces the full width.
     try testing.expectEqual(
-        @as(usize, 3 + (3 + 3 * 1) + (3 + 5 * 8) + 4),
+        @as(usize, row_header_len + (row_header_len + 3 * 1) + (row_header_len + 5 * 8) + 4),
         writer.buffered().len,
     );
 
@@ -1893,8 +1934,7 @@ test "grid rejects a row cell count above the column count" {
 
     var payload: [64]u8 = undefined;
     var writer: std.Io.Writer = .fixed(&payload);
-    try writer.writeByte(@bitCast(Row{}));
-    try io.writeInt(&writer, u16, 3);
+    try writeTestRowHeader(&writer, Row{}, 3, 3);
     for (0..3) |_| try io.writeInt(&writer, u64, 0);
     try io.writeInt(&writer, u32, 0);
 
@@ -1920,8 +1960,7 @@ test "grid normalizes incomplete wide cells" {
         // content but makes the incomplete wide cell narrow.
         var payload: [64]u8 = undefined;
         var payload_writer: std.Io.Writer = .fixed(&payload);
-        try payload_writer.writeByte(@bitCast(Row{ .cell_width = .eight }));
-        try io.writeInt(&payload_writer, u16, columns);
+        try writeTestRowHeader(&payload_writer, Row{ .cell_width = .eight }, columns, columns);
         try io.writeInt(&payload_writer, u64, @bitCast(Cell{
             .width = 1, // wide
             .content = 'A',
@@ -1975,8 +2014,7 @@ test "grid normalizes incomplete wide cells" {
 
     var payload: [64]u8 = undefined;
     var writer: std.Io.Writer = .fixed(&payload);
-    try writer.writeByte(@bitCast(Row{ .cell_width = .eight }));
-    try io.writeInt(&writer, u16, 1);
+    try writeTestRowHeader(&writer, Row{ .cell_width = .eight }, 1, 1);
     try io.writeInt(&writer, u64, @bitCast(Cell{
         .width = 1, // wide
         .content = 'W',
@@ -2005,11 +2043,12 @@ test "grid normalizes reserved cell values" {
     var payload: [64]u8 = undefined;
     var writer: std.Io.Writer = .fixed(&payload);
 
-    // Reserved row flag bits six and seven are ignored while the unknown
-    // semantic-prompt value degrades to none and wrap survives. Bits four
-    // and five select the full encoded cell width.
+    // Reserved row flag bit seven is ignored while the unknown semantic-prompt
+    // value degrades to none, wrap and word wrap survive, and bits four and
+    // five select the full encoded cell width.
     try writer.writeByte(0xFD);
-    try io.writeInt(&writer, u16, 3);
+    try io.writeInt(&writer, u16, 3); // content columns
+    try io.writeInt(&writer, u16, 3); // encoded cell count
 
     // A surrogate codepoint with reserved semantic content 3.
     try io.writeInt(&writer, u64, @bitCast(Cell{
@@ -2039,6 +2078,7 @@ test "grid normalizes reserved cell values" {
 
     const first = page.getRowAndCell(0, 0);
     try testing.expect(first.row.wrap);
+    try testing.expect(first.row.word_wrap);
     try testing.expectEqual(
         TerminalRow.SemanticPrompt.none,
         first.row.semantic_prompt,
@@ -2078,8 +2118,7 @@ test "grid drops undeliverable grapheme entries" {
 
     var payload: [128]u8 = undefined;
     var writer: std.Io.Writer = .fixed(&payload);
-    try writer.writeByte(@bitCast(Row{ .cell_width = .eight }));
-    try io.writeInt(&writer, u16, 4);
+    try writeTestRowHeader(&writer, Row{ .cell_width = .eight }, 4, 4);
     // A kind 1 cell that receives a valid entry.
     try io.writeInt(&writer, u64, @bitCast(Cell{ .kind = 1, .content = 'x' }));
     // A kind 1 cell without an entry decodes as a plain codepoint.
@@ -2151,8 +2190,7 @@ test "grid drops a complete grapheme when capacity fails mid-cluster" {
 
     var payload: [1024]u8 = undefined;
     var writer: std.Io.Writer = .fixed(&payload);
-    try writer.writeByte(@bitCast(Row{ .cell_width = .eight }));
-    try io.writeInt(&writer, u16, 4);
+    try writeTestRowHeader(&writer, Row{ .cell_width = .eight }, 4, 4);
     for (0..4) |i| try io.writeInt(
         &writer,
         u64,
@@ -2224,15 +2262,21 @@ test "grid encodes rows at their narrowest width" {
 
     const bytes = writer.buffered();
     try testing.expectEqual(
-        @as(usize, (3 + 2 * 1) + (3 + 1 * 2) + (3 + 2 * 4) + (3 + 1 * 8) + 4),
+        @as(usize, (row_header_len + 2 * 1) +
+            (row_header_len + 1 * 2) +
+            (row_header_len + 2 * 4) +
+            (row_header_len + 1 * 8) + 4),
         bytes.len,
     );
 
     // Each row header carries the expected width bits.
+    const row1 = row_header_len + 2 * 1;
+    const row2 = row1 + row_header_len + 1 * 2;
+    const row3 = row2 + row_header_len + 2 * 4;
     try testing.expectEqual(@as(u8, 0 << 4), bytes[0] & 0x30);
-    try testing.expectEqual(@as(u8, 1 << 4), bytes[5] & 0x30);
-    try testing.expectEqual(@as(u8, 2 << 4), bytes[10] & 0x30);
-    try testing.expectEqual(@as(u8, 3 << 4), bytes[21] & 0x30);
+    try testing.expectEqual(@as(u8, 1 << 4), bytes[row1] & 0x30);
+    try testing.expectEqual(@as(u8, 2 << 4), bytes[row2] & 0x30);
+    try testing.expectEqual(@as(u8, 3 << 4), bytes[row3] & 0x30);
 
     var destination = try TerminalPage.init(.{
         .cols = 2,
@@ -2288,8 +2332,7 @@ test "grid decodes non-canonical cell widths" {
     // A bare ASCII row encoded at the full width is wasteful but valid.
     var payload: [64]u8 = undefined;
     var writer: std.Io.Writer = .fixed(&payload);
-    try writer.writeByte(@bitCast(Row{ .cell_width = .eight }));
-    try io.writeInt(&writer, u16, 2);
+    try writeTestRowHeader(&writer, Row{ .cell_width = .eight }, 2, 2);
     try io.writeInt(&writer, u64, @bitCast(Cell{ .content = 'o' }));
     try io.writeInt(&writer, u64, @bitCast(Cell{ .content = 'k' }));
     try io.writeInt(&writer, u32, 0);
@@ -2310,7 +2353,7 @@ test "grid decodes non-canonical cell widths" {
     var reencoded: [16]u8 = undefined;
     var rewriter: std.Io.Writer = .fixed(&reencoded);
     try encode(&page, &rewriter);
-    try testing.expectEqual(@as(usize, 3 + 2 + 4), rewriter.buffered().len);
+    try testing.expectEqual(@as(usize, row_header_len + 2 + 4), rewriter.buffered().len);
 }
 
 test "grid normalizes surrogates in two-byte cells" {
@@ -2324,8 +2367,7 @@ test "grid normalizes surrogates in two-byte cells" {
 
     var payload: [16]u8 = undefined;
     var writer: std.Io.Writer = .fixed(&payload);
-    try writer.writeByte(@bitCast(Row{ .cell_width = .two }));
-    try io.writeInt(&writer, u16, 2);
+    try writeTestRowHeader(&writer, Row{ .cell_width = .two }, 2, 2);
     try io.writeInt(&writer, u16, 0xD800);
     try io.writeInt(&writer, u16, 0x0416);
     try io.writeInt(&writer, u32, 0);
@@ -2358,8 +2400,7 @@ test "grid four-byte cells run full normalization" {
 
     var payload: [32]u8 = undefined;
     var writer: std.Io.Writer = .fixed(&payload);
-    try writer.writeByte(@bitCast(Row{ .cell_width = .four }));
-    try io.writeInt(&writer, u16, 3);
+    try writeTestRowHeader(&writer, Row{ .cell_width = .four }, 3, 3);
 
     // The Kitty placeholder does not fit two-byte cells but fits here
     // and must still derive the native row hint.

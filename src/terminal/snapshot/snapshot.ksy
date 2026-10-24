@@ -923,6 +923,14 @@ types:
     seq:
       - id: flags
         type: grid_row_flags
+      - id: content_cols
+        doc: |
+          Number of columns the row's content occupies, including the seam
+          space of a word-wrapped row. Everything past it is blank or
+          decorative and is dropped by reflow-on-resize.
+        type: u2
+        valid:
+          expr: _ <= columns
       - id: cell_count
         type: u2
         valid:
@@ -943,7 +951,7 @@ types:
       - id: raw
         type: u1
         valid:
-          expr: (_ & 0xc0) == 0 and ((_ >> 2) & 0x3) <= 2
+          expr: (_ & 0x80) == 0 and ((_ >> 2) & 0x3) <= 2
     instances:
       wrap:
         value: (raw & 1) != 0
@@ -953,6 +961,9 @@ types:
         value: (raw >> 2) & 0x3
       width_log2:
         value: (raw >> 4) & 0x3
+      word_wrap:
+        doc: Soft-wrapped at a word boundary (DEC 2049); always also wrap.
+        value: (raw & 0x40) != 0
 
   grid_cell_1:
     doc: One-byte encoded cell; the value is a codepoint at or below U+00FF.
