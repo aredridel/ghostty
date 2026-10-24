@@ -65,6 +65,7 @@ pub const Action = union(Key) {
     erase_line_left: bool,
     erase_line_complete: bool,
     erase_line_right_unless_pending_wrap: bool,
+    erase_line_logical: bool,
     delete_chars: usize,
     erase_chars: usize,
     insert_lines: usize,
@@ -175,6 +176,7 @@ pub const Action = union(Key) {
             "erase_line_left",
             "erase_line_complete",
             "erase_line_right_unless_pending_wrap",
+            "erase_line_logical",
             "delete_chars",
             "erase_chars",
             "insert_lines",
@@ -1736,7 +1738,11 @@ pub fn Stream(comptime H: type) type {
 
                     const mode_: ?csi.EraseLine = switch (input.params.len) {
                         0 => .right,
-                        1 => if (input.params[0] < 3) @fromBackingInt(@truncate(input.params[0])) else null,
+                        1 => switch (input.params[0]) {
+                            0, 1, 2 => @fromBackingInt(@truncate(input.params[0])),
+                            5 => .erase_line_logical,
+                            else => null,
+                        },
                         else => null,
                     };
 
@@ -1751,6 +1757,7 @@ pub fn Stream(comptime H: type) type {
                         .left => self.handler.vt(.erase_line_left, protected),
                         .complete => self.handler.vt(.erase_line_complete, protected),
                         .right_unless_pending_wrap => self.handler.vt(.erase_line_right_unless_pending_wrap, protected),
+                        .erase_line_logical => self.handler.vt(.erase_line_logical, protected),
                         _ => {
                             @branchHint(.unlikely);
                             log.warn("invalid erase line mode: {}", .{mode});

@@ -649,6 +649,7 @@ pub const Handler = struct {
             .erase_line_left => self.terminal.eraseLine(.left, value),
             .erase_line_complete => self.terminal.eraseLine(.complete, value),
             .erase_line_right_unless_pending_wrap => self.terminal.eraseLine(.right_unless_pending_wrap, value),
+            .erase_line_logical => self.terminal.eraseLogicalLine(value),
             .delete_chars => self.terminal.deleteChars(value),
             .erase_chars => self.terminal.eraseChars(value),
             .insert_lines => self.terminal.insertLines(value),

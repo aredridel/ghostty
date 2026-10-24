@@ -3899,6 +3899,59 @@ pub fn eraseLine(
     );
 }
 
+/// Erase the current soft-wrapped logical line: every physical row that
+/// makes up the line containing the cursor, then home the cursor to column
+/// 0 of the line's first row. A logical line is the run of rows connected
+/// by soft-wrap (including DEC 2049 word-wrap breaks). This backs the
+/// Ghostty-private \`CSI 5 K\` extension; webtty's client uses it to repaint
+/// a possibly-wrapped input or prompt line without knowing how many
+/// physical rows it occupies.
+pub fn eraseLogicalLine(
+    self: *Terminal,
+    protected_req: bool,
+) void {
+    const screen = self.screens.active;
+    const cursor = &screen.cursor;
+
+    // Soft-wrap only occurs within the scrolling region, so the logical line
+    // is bounded by it as well.
+    const top = self.scrolling_region.top;
+    const bottom = self.scrolling_region.bottom;
+
+    // Find the first row of the logical line: a row is a continuation of
+    // the row above when that row soft-wrapped (its .wrap flag is set). The
+    // cursor pin sits at cursor.y, so moving it up (cursor.y - row) rows
+    // puts it on absolute row \`row\`.
+    var first: size.CellCountInt = cursor.y;
+    while (first > top) {
+        const above = cursor.page_pin.up(@intCast(cursor.y - (first - 1))).?;
+        if (!above.rowAndCell().row.wrap) break;
+        first -= 1;
+    }
+
+    // Find the last row: the line continues while the row at \`last\` wraps.
+    var last: size.CellCountInt = cursor.y;
+    while (last < bottom) {
+        const at = cursor.page_pin.down(@intCast(last - cursor.y)).?;
+        if (!at.rowAndCell().row.wrap) break;
+        last += 1;
+    }
+
+    // Erase every physical row of the logical line. When not protecting,
+    // clearRows also resets each row's soft-wrap flags, so the erased line
+    // is a standalone blank line rather than a dangling wrap continuation.
+    screen.clearRows(
+        .{ .active = .{ .x = 0, .y = first } },
+        .{ .active = .{ .x = 0, .y = last } },
+        protected_req,
+    );
+
+    // Home the cursor to the start of the (now blank) logical line and
+    // clear pending-wrap state so the next print starts fresh.
+    screen.cursorAbsolute(0, first);
+    cursor.pending_wrap = false;
+}
+
 /// Erase the display.
 pub fn eraseDisplay(
     self: *Terminal,
@@ -14938,6 +14991,99 @@ test "Terminal: eraseLine resets wrap" {
         const str = try t.plainString(testing.allocator);
         defer testing.allocator.free(str);
         try testing.expectEqualStrings("X\n123", str);
+    }
+}
+
+test "Terminal: eraseLogicalLine clears every physical row of a wrapped line" {
+    const alloc = testing.allocator;
+    const io_impl = testing.io;
+    var t = try init(io_impl, alloc, .{ .rows = 5, .cols = 5 });
+    defer t.deinit(alloc);
+
+    // "ABCDE123" wraps into two physical rows.
+    for ("ABCDE123") |c| try t.print(c);
+    try testing.expect(t.screens.active.pages.getCell(.{ .active = .{ .x = 0, .y = 0 } }).?.row.wrap);
+    try testing.expect(t.screens.active.pages.getCell(.{ .active = .{ .x = 0, .y = 1 } }).?.row.wrap_continuation);
+
+    // Cursor sits on the second physical row; the whole logical line goes.
+    t.setCursorPos(2, 1);
+    t.eraseLogicalLine(false);
+
+    try testing.expectEqual(@as(size.CellCountInt, 0), t.screens.active.cursor.x);
+    try testing.expectEqual(@as(size.CellCountInt, 0), t.screens.active.cursor.y);
+    try testing.expect(!t.screens.active.cursor.pending_wrap);
+
+    // Both physical rows are blank and carry no soft-wrap flags.
+    for (0..2) |y| {
+        for (0..5) |x| {
+            const got = t.screens.active.pages.getCell(.{
+                .active = .{ .x = @intCast(x), .y = @intCast(y) },
+            }).?;
+            try testing.expect(got.cell.isEmpty());
+            try testing.expect(!got.row.wrap);
+            try testing.expect(!got.row.wrap_continuation);
+        }
+    }
+}
+
+test "Terminal: eraseLogicalLine leaves neighbouring lines alone" {
+    const alloc = testing.allocator;
+    const io_impl = testing.io;
+    var t = try init(io_impl, alloc, .{ .rows = 5, .cols = 5 });
+    defer t.deinit(alloc);
+
+    // Row 0 "AB", rows 1-2 the wrapped line "CDEFG12", row 3 "ZZ".
+    for ("AB\r\nCDEFG12\r\nZZ") |c| try t.print(c);
+
+    // Cursor in the middle of the wrapped line.
+    t.setCursorPos(1, 2);
+    t.eraseLogicalLine(false);
+
+    // Cursor homes to the first row of the erased logical line.
+    try testing.expectEqual(@as(size.CellCountInt, 0), t.screens.active.cursor.x);
+    try testing.expectEqual(@as(size.CellCountInt, 1), t.screens.active.cursor.y);
+
+    // Rows 1 and 2 are blank, rows 0 and 3 are untouched.
+    try testing.expectEqual(@as(u21, 'A'), t.screens.active.pages.getCell(.{ .active = .{} }).?.cell.codepoint());
+    try testing.expectEqual(@as(u21, 'Z'), t.screens.active.pages.getCell(.{ .active = .{ .y = 3 } }).?.cell.codepoint());
+    for (1..3) |y| {
+        for (0..5) |x| {
+            const got = t.screens.active.pages.getCell(.{
+                .active = .{ .x = @intCast(x), .y = @intCast(y) },
+            }).?;
+            try testing.expect(got.cell.isEmpty());
+        }
+    }
+}
+
+test "Terminal: eraseLogicalLine covers word-wrapped rows" {
+    const alloc = testing.allocator;
+    const io_impl = testing.io;
+    var t = try init(io_impl, alloc, .{ .rows = 5, .cols = 5 });
+    defer t.deinit(alloc);
+
+    // Word wrap moves the trailing word instead of breaking mid-word.
+    t.modes.set(.word_wrap, true);
+    t.screens.active.pages.word_wrap_boundaries = t.word_wrap_boundaries;
+
+    // "AB CDE" fits 5 cells, so "CD" moves down and "E" follows it.
+    for ("AB CDE") |c| try t.print(c);
+    try testing.expect(t.screens.active.pages.getCell(.{ .active = .{} }).?.row.wrap);
+    try testing.expect(t.screens.active.pages.getCell(.{ .active = .{} }).?.row.word_wrap);
+
+    t.setCursorPos(2, 1);
+    t.eraseLogicalLine(false);
+
+    try testing.expectEqual(@as(size.CellCountInt, 0), t.screens.active.cursor.x);
+    try testing.expectEqual(@as(size.CellCountInt, 0), t.screens.active.cursor.y);
+    for (0..2) |y| {
+        for (0..5) |x| {
+            const got = t.screens.active.pages.getCell(.{
+                .active = .{ .x = @intCast(x), .y = @intCast(y) },
+            }).?;
+            try testing.expect(got.cell.isEmpty());
+            try testing.expect(!got.row.word_wrap);
+        }
     }
 }
 

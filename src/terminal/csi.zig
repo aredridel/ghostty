@@ -19,6 +19,12 @@ pub const EraseLine = enum(u8) {
     complete = 2,
     right_unless_pending_wrap = 4,
 
+    /// Erase the entire soft-wrapped logical line (all physical rows it
+    /// spans) and home the cursor to column 0 of its first row.
+    /// Ghostty-private extension used by webtty's client to repaint a
+    /// possibly-wrapped input line (\`CSI 5 K\`).
+    erase_line_logical = 5,
+
     // Non-exhaustive so that @intToEnum never fails since the inputs are
     // user-generated.
     _,
