@@ -1723,6 +1723,22 @@ pub fn scroll_viewport(
     });
 }
 
+/// Read a terminal mode (DEC private or ANSI).
+///
+/// C: ghostty_terminal_get_mode
+pub fn get_mode(
+    terminal_: Terminal,
+    mode_: modes.ModeTag.Backing,
+    out: ?*bool,
+) callconv(lib.calling_conv) Result {
+    const t: *ZigTerminal = (terminal_ orelse return .invalid_value).terminal;
+    const out_ = out orelse return .invalid_value;
+    const tag: modes.ModeTag = @bitCast(mode_);
+    const mode = modes.modeFromInt(tag.value, tag.ansi) orelse return .invalid_value;
+    out_.* = t.modes.get(mode);
+    return .success;
+}
+
 pub fn resize(
     terminal_: Terminal,
     cols: size.CellCountInt,

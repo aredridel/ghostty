@@ -3314,6 +3314,22 @@ GHOSTTY_API GhosttyResult ghostty_terminal_compress(
  *
  * @ingroup terminal
  */
+/**
+ * Read a terminal mode.
+ *
+ * @param terminal Terminal to query (must not be NULL)
+ * @param mode Mode to read, built with ghostty_mode_new()
+ * @param[out] out Receives whether the mode is set (must not be NULL)
+ * @return GHOSTTY_SUCCESS on success, or GHOSTTY_INVALID_VALUE if an
+ *         argument is NULL or the mode is not recognized
+ *
+ * @ingroup terminal
+ */
+GHOSTTY_API GhosttyResult ghostty_terminal_get_mode(
+    GhosttyTerminal terminal,
+    GhosttyMode mode,
+    bool* out);
+
 GHOSTTY_API GhosttyResult ghostty_terminal_get(GhosttyTerminal terminal,
                                     GhosttyTerminalData data,
                                     void *out);
